@@ -1,0 +1,38 @@
+# Grid search configuration for Phase 2
+# Sweep over layer, filter complexity, and loss function
+
+grid:
+  layers:
+    - "backbone_3"           # Candidate 1: early backbone (from Phase 1 diagnostics)
+    - "encoder_output"       # Candidate 2: encoder output
+    - "backbone_6"           # Candidate 3: mid backbone (optional, if Phase 1 shows secondary peak)
+
+  filters:
+    - type: "affine_6param"
+      params: 6
+    - type: "matrix_12param"
+      params: 12
+
+  loss_functions:
+    - "l2"                   # L2 norm (primary)
+    # - "cosine"             # Cosine similarity (secondary, usually minimal difference)
+
+training:
+  optimizer: "adam"
+  learning_rate: 0.001
+  max_steps: 100
+  early_stopping_patience: 10
+  batch_size: 1              # Constrained by GPU memory with activations
+
+validation:
+  split: 0.2                 # 20% of scenes held out for validation
+  random_seed: 42
+
+logging:
+  log_every_n_steps: 5
+  save_checkpoint_every_n_steps: 10
+
+output:
+  results_csv: "results/runs.csv"
+  checkpoints_dir: "results/checkpoints/"
+  activations_cache_dir: "data/processed/activations_cache/"

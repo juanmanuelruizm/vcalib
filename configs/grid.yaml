@@ -1,12 +1,46 @@
 # Grid search configuration for Phase 2
-# Sweep over layer, filter complexity, and loss function
+#
+# SCOPE: the sweep is over GROUPS of layers, not individual layers. The calibration
+# loss aggregates a per-layer distance across all layers in a group (see `loss`).
+# Groups come from two sources, unioned (explicit baselines win on collisions):
+#   1. `layer_groups`       -- hand-curated named baselines (supports range syntax)
+#   2. `layer_group_search` -- auto-generated candidates for the automatic search loop
+# Resolve with:  uv run python src/utils/layer_groups.py --config configs/grid.yaml --dump
 
+# --- Explicit baseline groups (range syntax "prefix.start..end" is inclusive) ---
+layer_groups:
+  - name: "backbone.early"
+    layers: ["backbone.layer.0..3"]          # DINOv2 blocks 0-3 (photometric signal)
+  - name: "backbone.mid"
+    layers: ["backbone.layer.4..7"]          # DINOv2 blocks 4-7
+  - name: "backbone.late"
+    layers: ["backbone.layer.8..11"]         # DINOv2 blocks 8-11
+  - name: "backbone.all"
+    layers: ["backbone.layer.0..11"]         # all 12 DINOv2 blocks
+  - name: "projector"
+    layers: ["backbone.projector"]           # multi-scale projector = encoder memory
+  - name: "decoder.all"
+    layers: ["decoder.layer.0..1"]           # both decoder layers
+  - name: "encoder+decoder"
+    layers: ["backbone.projector", "decoder.layer.0..1"]
+  - name: "all"
+    layers: ["backbone.layer.0..11", "backbone.projector", "decoder.layer.0..1"]
+
+# --- Auto-generated candidate groups (drives the automatic layer-search loop) ---
+# Produces contiguous windows of DINOv2 backbone blocks of the given sizes/stride,
+# optionally with the projector (+proj) and/or decoder (+dec) appended. Names are
+# deterministic: auto.b<start>_<end>[+proj][+dec], plus auto.b<i> singletons.
+layer_group_search:
+  enabled: true
+  backbone: "backbone.layer.0..11"           # ordered blocks to window over
+  window_sizes: [2, 4, 6]                    # contiguous window lengths to try
+  stride: 2                                  # step between window starts
+  attach_projector: true                     # also emit "<window>+proj" groups
+  attach_decoder: false
+  singletons: false
+
+# --- Grid axes crossed with each resolved layer group ---
 grid:
-  layers:
-    - "backbone_3"           # Candidate 1: early backbone (from Phase 1 diagnostics)
-    - "encoder_output"       # Candidate 2: encoder output
-    - "backbone_6"           # Candidate 3: mid backbone (optional, if Phase 1 shows secondary peak)
-
   filters:
     - type: "affine_6param"
       params: 6
@@ -14,18 +48,27 @@ grid:
       params: 12
 
   loss_functions:
-    - "l2"                   # L2 norm (primary)
-    # - "cosine"             # Cosine similarity (secondary, usually minimal difference)
+    - "l2"                                   # L2 (primary)
+    # - "cosine"                             # Cosine (secondary, usually minimal difference)
+
+# --- Loss aggregation across the layers of a group ---
+# Layers have heterogeneous shapes (backbone (4,145,384), projector (1,256,24,24),
+# decoder (1,300,256)). A per-layer normalized distance keeps every layer on a
+# comparable scale so bigger tensors don't dominate; the group loss aggregates them.
+loss:
+  per_layer_metric: "l2_rel"                 # ||a-b||_2 / ||a||_2 (relative L2)
+  aggregation: "mean"                        # combine per-layer distances: mean | sum
+  # per_layer_metric: "cosine"               # alternative: 1 - cos(a, b)
 
 training:
   optimizer: "adam"
   learning_rate: 0.001
   max_steps: 100
   early_stopping_patience: 10
-  batch_size: 1              # Constrained by GPU memory with activations
+  batch_size: 1                              # Constrained by GPU memory with activations
 
 validation:
-  split: 0.2                 # 20% of scenes held out for validation
+  split: 0.2                                 # 20% of scenes held out for validation
   random_seed: 42
 
 logging:

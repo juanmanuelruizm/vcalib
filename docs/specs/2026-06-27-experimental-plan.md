@@ -53,10 +53,10 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 ## 5. Scope
 
 ### In Scope
-- Pixel-space parametric filters: affine per-channel (6 params), full matrix 3×3 + offset (12 params).
+- **Full pixel-space parametric filter library** (built upfront so the grid/automatic search can sweep filter types too, not just layer groups): brightness (2), white-balance (3), affine per-channel (6), saturation (1), contrast (1), gamma per-channel (3), matrix 3×3 + offset (12), and ordered **composites** that chain corrections a single filter cannot express (linear + non-linear + color).
 - Reusable calibration loop (`src/calibration.py`) shared by grid search and the deployed tool.
-- Diagnostic sweep to find which layer carries illumination signal.
-- Grid search to pick layer + filter + loss, validated on a held-out split.
+- Diagnostic sweep to find which layers carry illumination signal.
+- Grid search to pick layer group + filter + loss, validated on a held-out split.
 - Proxy benchmark (agreement with A's predictions) + calibration-cost measurement.
 - A deployable calibration CLI (`src/deploy_calibrate.py`).
 
@@ -64,7 +64,7 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 - Retraining / fine-tuning RF-DETR (frozen throughout).
 - Domain adaptation (adversarial, unsupervised).
 - Other sensors (multi-spectral, thermal).
-- Non-parametric filters (LUTs, curves) — optional future tier if parametric saturate.
+- Non-parametric filters (LUTs, free-form splines) — the gamma/contrast/saturation filters cover the main non-linearities; full LUTs remain a future tier if parametric composites saturate.
 - True mAP evaluation / ground-truth labeling (using proxy instead).
 - Synthetic illumination dataset (Carlos opted for real capture).
 
@@ -73,8 +73,10 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 | Component | File | Role |
 |-----------|------|------|
 | Activation helper | `src/utils/activations.py` | Load frozen RF-DETR nano via LibreYOLO; `extract_activations(image)` → named layer dict via **PyTorch forward hooks** on `libre.model.model` submodules (LibreYOLO does not expose `output_hidden_states`); cache/load to `data/processed/activations_cache/`. Real layer names: `backbone.layer.0..11`, `backbone.projector`, `decoder.layer.0..1`. |
-| Affine filter | `src/filters/affine_6param.py` | `Affine6Param(nn.Module)`: gains `a_c∈[0.1,2.0]`, offsets `b_c∈[-1,1]`, identity init, `forward(x)→clamp[0,1]`, `get_params()`. |
-| Matrix filter | `src/filters/matrix_12param.py` | `Matrix12Param(nn.Module)`: `I' = M·I + b`, M init = identity. Same pixel-space contract. |
+| Filter library | `src/filters/` | Parametric pixel-space filters on [0,1] NCHW RGB, identity init = no-op, output clamped to [0,1]. `Filter` base + 7 concrete filters (brightness/white-balance/affine/saturation/contrast/gamma/matrix) + `CompositeFilter` chain. `FILTER_REGISTRY` + `get_filter(name)` / `build_filter(spec)` factory consumed by the grid. |
+| Affine filter | `src/filters/affine_6param.py` | `Affine6Param`: gains `a_c∈[0.1,2.0]`, offsets `b_c∈[-1,1]`, identity init. Flagship linear. |
+| Matrix filter | `src/filters/matrix_12param.py` | `Matrix12Param`: `I' = M·I + b`, M init = identity, M∈[-2,2]. Flagship linear w/ cross-channel coupling. |
+| Other filters | `src/filters/{brightness,white_balance,saturation,contrast,gamma}_*.py` | brightness(2), white-balance(3), saturation(1, toward luma), contrast(1, around image mean), gamma(3, per-channel tone curve). |
 | Calibration loop | `src/calibration.py` (new) | Core loop shared by grid search + deployed tool: given filter, stored A-targets, B image, **layer group**, loss+aggregation cfg, optimizer cfg → gradient steps minimizing the **group loss** (mean of per-layer normalized distances), early stopping → trained filter + convergence stats. |
 | Layer-group helper | `src/utils/layer_groups.py` | Encodes the group-based sweep: `LayerGroup` dataclass, range-syntax expansion (`"backbone.layer.0..3"`), explicit-group loader + auto-search generator (contiguous DINOv2 windows, `+proj`/`+dec`), `resolve_grid_groups()` union. Drives the automatic layer-search loop. |
 | Phase 1 diagnostics | `src/diagnostics.py` | Per-layer L2(normalized)+cosine distance per illumination level, aggregated mean±std over scenes → `results/phase1_diagnostics.json` + heatmap/line plots. Early-bailout if flat. (Diagnostics stay per-layer to guide group design.) |
@@ -90,19 +92,30 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 
 ### Parametric filter design
 
+The full library is built upfront (scope expansion: the grid sweeps filter types too).
+All operate on the [0,1] RGB tensor before normalization, identity init = no-op.
+
 | Filter | Params | Physics | Caveats |
 |--------|--------|---------|---------|
-| **Affine per-channel** `I'_c = a_c·I_c + b_c` | 6 | Sensor gain + per-channel offset (white balance + exposure) | No cross-channel mixing / non-linearity |
-| **Matrix 3×3 + offset** `I' = M·I + b` | 12 | ISP color-correction matrix (CCM); cross-channel coupling | Still linear; no gamma / clipping |
-| **Curves (optional)** spline/channel | 12–24 | Non-linear tone response | Overfitting risk; only if needed |
+| **Brightness** `I' = a·I + b` (global) | 2 | Exposure / illumination intensity | No per-channel / cross-channel |
+| **White balance** `I'_c = a_c·I_c` | 3 | Color-temperature / white-balance gains | No offset (black-level) |
+| **Affine per-channel** `I'_c = a_c·I_c + b_c` | 6 | Sensor gain + per-channel offset (WB + exposure) | No cross-channel mixing / non-linearity |
+| **Saturation** `I' = L + s·(I−L)` (luma) | 1 | Color vividness / desaturation | Single global scalar |
+| **Contrast** `I' = μ + c·(I−μ)` (image mean) | 1 | Contrast / haze | Adaptive to image mean |
+| **Gamma** `I'_c = I_c^{γ_c}` (per-channel) | 3 | Non-linear tone response | First non-linear tier |
+| **Matrix 3×3 + offset** `I' = M·I + b` | 12 | ISP CCM; cross-channel coupling | Still linear; no gamma/clipping |
+| **Composite** ordered chain | Σ | Combine linear + non-linear + color | Overfitting risk at high param count |
 
-Start at 6 params; escalate to 12 only if Phase 2 shows systematic residuals.
+Start with the cheap low-param filters (brightness / white-balance / affine) and the
+flagship linear (matrix); escalate to gamma + composites only if single filters plateau.
+`configs/grid.yaml::grid.filters` lists the active sweep; composites are commented out
+by default to keep the grid tractable (35 groups × N filters × 1 loss).
 
 ## 7. Phased Execution (phases are blockers)
 
 **Phase A — Unblocked now (no dataset needed)**
 1. `uv sync`; verify `rf-detr-nano` loads; dump real layer names/shapes; replace placeholder names in `configs/grid.yaml` + activations helper.
-2. Implement both filters + `src/calibration.py`; unit tests (identity = no-op, params in range, single-image smoke test that the loop reduces activation distance on a programmatically re-lit image).
+2. Implement the full filter library (`src/filters/`) + `src/calibration.py`; unit tests (identity = no-op, params in range, single-image smoke test that the loop reduces activation distance on a programmatically re-lit image).
 3. (This rewrite.) Spec + `tasks/todo.md` reflect the tool reframing.
 4. Finalize the capture protocol (fixed calibration scene + dev dataset).
 

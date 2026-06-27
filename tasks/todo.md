@@ -21,9 +21,13 @@
   - `cache_activations()` / `load_cached_activations()` → `data/processed/activations_cache/`
   - Verified: 15 layers captured with correct shapes; `ruff`/`mypy` clean; 12 unit tests pass
 
-- [ ] **A3. Filters**
-  - [ ] `src/filters/affine_6param.py` — gains `[0.1,2.0]`, offsets `[-1,1]`, identity init, `forward→clamp[0,1]`, `get_params()`
-  - [ ] `src/filters/matrix_12param.py` — `I' = M·I + b`, M init = identity, same pixel-space contract
+- [x] **A3. Filters** — full library built upfront (scope expanded so the grid sweeps filter types too)
+  - [x] `src/filters/base.py` — `Filter` base (4D wrap, clamp01, `num_params`, `get_params`); `clamp_param` helper
+  - [x] `brightness_2param`, `white_balance_3param`, `saturation_1param`, `contrast_1param`, `gamma_3param` — exposure, WB, vividness, contrast, non-linear tone
+  - [x] `affine_6param` (gains `[0.1,2.0]`, offsets `[-1,1]`, identity init) + `matrix_12param` (`I'=M·I+b`, M=identity)
+  - [x] `composite.py` — `CompositeFilter` chains ordered filters (variable params)
+  - [x] `__init__.py` — `FILTER_REGISTRY` + `get_filter(name)` / `build_filter(spec)` factory for the grid/automatic search
+  - Verified: identity=no-op on real photos, params in range, 59 filter tests pass
 
 - [ ] **A4. Calibration loop (`src/calibration.py`, new)**
   - Input: filter, stored A-targets, B image, **layer group** (from `layer_groups.py`), loss+aggregation cfg, optimizer cfg
@@ -33,9 +37,9 @@
   - Shared by grid search **and** the deployed tool
 
 - [ ] **A5. Unit tests (`tests/test_filters.py`)**
-  - Identity init = no-op; params stay in range
-  - Smoke: loop reduces activation distance on one image with a programmatic light tweak (smoke only, not a dataset)
-  - `uv run pytest tests/ -v` green; `uv run mypy src/` + `uv run ruff check src/` clean
+  - Identity init = no-op (every filter, incl. on real photos in `data/raw/`); params stay in range
+  - Registry `get_filter`/`build_filter`/`make_composite`; composite chaining & param counts
+  - 59 filter tests passing; smoke: loop reduces activation distance on one image with a programmatic light tweak (smoke only, not a dataset) — **pending A4**
 
 - [x] **A6. Rewrite spec + this todo to match the tool reframing** (done)
 

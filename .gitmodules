@@ -1,0 +1,3 @@
+[submodule "3rd_party/libreyolo"]
+	path = 3rd_party/libreyolo
+	url = https://github.com/LibreYOLO/libreyolo.git

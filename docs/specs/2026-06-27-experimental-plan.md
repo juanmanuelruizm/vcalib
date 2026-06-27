@@ -1,6 +1,6 @@
 # Spec: vcalib — Illumination-Calibration Filter for RF-DETR nano
 
-**Status:** Approved (reframed as deployable tool)
+**Status:** Approved (reframed as deployable tool). Filter-design subsection superseded by `2026-06-27-advanced-filters.md` (expressiveness-first: parameter count is NOT a constraint; held-out validation is the primary guardrail).
 **Date:** 2026-06-27
 **Owner:** Carlos
 
@@ -8,18 +8,19 @@
 
 ## 1. Objective
 
-Build a deployable **on-edge calibration tool**: a tiny learnable preprocessing filter
-(6–12 parameters) that edits the *input image* so that a frozen RF-DETR nano model produces
+Build a deployable **on-edge calibration tool**: a learnable differentiable preprocessing
+filter that edits the *input image* so that a frozen RF-DETR nano model produces
 the same *intermediate activations* under new lighting (condition B) as it did under the
 reference lighting it was validated on (condition A). The **distance between activations** is
 the training signal — the filter only touches pixels, never the model. Calibration must run on
-edge in seconds, with no model retraining.
+edge in seconds, with no model retraining. **Parameter count is not a constraint; the primary
+guardrail is held-out validation generalization** (see `2026-06-27-advanced-filters.md`).
 
 ## 2. How It Works (the core idea)
 
 1. Capture aligned image pairs: same camera/tripod/framing/objects; **only illumination changes** (A → B).
 2. Forward both through frozen RF-DETR nano; read intermediate activations at a chosen layer.
-3. Insert a small pixel-space filter before the model. Optimize its 6–12 params (gradient
+3. Insert a pixel-space filter before the model. Optimize its parameters (gradient
    descent) so that the **filtered-B** activations match the **stored-A** activations.
 4. Because activations align, the model's *outputs* on filtered-B approximate those on A —
    recovering detection quality without retraining.
@@ -30,7 +31,7 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 
 1. **Aligned pairs.** Position-for-position comparable activations require identical framing; only light differs.
 2. **Reference A precomputed offline.** Store A's target activations once; at deploy time only B is seen and pulled toward stored A.
-3. **Filter edits pixels, not activations.** Per-channel affine (6 params) or 3×3 matrix + offset (12 params), operating on the 0–1 RGB tensor before the model's normalization.
+3. **Filter edits pixels, not activations.** Chosen from the filter library (`src/filters/`): affine/matrix through 3D LUTs/tone curves — filter type is chosen by the grid, not fixed. Operates on the 0–1 RGB tensor before the model's normalization.
 4. **Layer chosen by the diagnostic sweep, evaluated over GROUPS of layers.** The loss aggregates a per-layer distance across all layers in a group, not at a single layer. Groups are encoded declaratively (explicit baselines + auto-generated contiguous-window candidates) in `configs/grid.yaml` and resolved by `src/utils/layer_groups.py`, so an automatic layer-search loop can iterate candidate groups.
 5. **Goal = deployable on-edge tool** (calibrate in seconds), not just a research report.
 6. **Metric = proxy.** Agreement with A's predictions (box IoU + class agreement). No true mAP / ground-truth labeling.
@@ -53,7 +54,7 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 ## 5. Scope
 
 ### In Scope
-- **Full pixel-space parametric filter library** (built upfront so the grid/automatic search can sweep filter types too, not just layer groups): brightness (2), white-balance (3), affine per-channel (6), saturation (1), contrast (1), gamma per-channel (3), matrix 3×3 + offset (12), and ordered **composites** that chain corrections a single filter cannot express (linear + non-linear + color).
+- **Full pixel-space differentiable filter library** (built upfront so the grid/automatic search can sweep filter types too, not just layer groups): brightness (2), white-balance (3), affine per-channel (6), saturation (1), contrast (1), gamma per-channel (3), matrix 3×3 + offset (12), ordered **composites**, **spatially-varying** variants (bilinear K×K control grid), and **advanced high-capacity filters** — 3D LUT, per-channel monotone tone curves, high-order/root-polynomial CCM, LMS/Bradford chromatic adaptation, large-K spatial tone curve, CLAHE-like local tone mapping, low-rank 3D LUT (see `2026-06-27-advanced-filters.md`). Parameter count is not a constraint; held-out validation is the primary guardrail.
 - Reusable calibration loop (`src/calibration.py`) shared by grid search and the deployed tool.
 - Diagnostic sweep to find which layers carry illumination signal.
 - Grid search to pick layer group + filter + loss, validated on a held-out split.
@@ -64,7 +65,8 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 - Retraining / fine-tuning RF-DETR (frozen throughout).
 - Domain adaptation (adversarial, unsupervised).
 - Other sensors (multi-spectral, thermal).
-- Non-parametric filters (LUTs, free-form splines) — the gamma/contrast/saturation filters cover the main non-linearities; full LUTs remain a future tier if parametric composites saturate.
+- Unconstrained free-form splines (structured LUTs/curves ARE in scope; only fully free-form per-pixel mappings stay out).
+- True differentiable CLAHE with soft sliding-window histograms (a CLAHE-like guided-filter approximation IS in scope; the full operator is future stretch).
 - True mAP evaluation / ground-truth labeling (using proxy instead).
 - Synthetic illumination dataset (Carlos opted for real capture).
 
@@ -77,6 +79,7 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 | Affine filter | `src/filters/affine_6param.py` | `Affine6Param`: gains `a_c∈[0.1,2.0]`, offsets `b_c∈[-1,1]`, identity init. Flagship linear. |
 | Matrix filter | `src/filters/matrix_12param.py` | `Matrix12Param`: `I' = M·I + b`, M init = identity, M∈[-2,2]. Flagship linear w/ cross-channel coupling. |
 | Other filters | `src/filters/{brightness,white_balance,saturation,contrast,gamma}_*.py` | brightness(2), white-balance(3), saturation(1, toward luma), contrast(1, around image mean), gamma(3, per-channel tone curve). |
+| Spatial filters | `src/filters/spatial.py` | Zone-dependent variants of brightness/white-balance/affine/gamma via a bilinear K×K control grid (`grid_sample` upsample). Params = K²·n_field (K configurable). For non-uniform illumination (vignetting, directional light, partial shadow). |
 | Calibration loop | `src/calibration.py` (new) | Core loop shared by grid search + deployed tool: given filter, stored A-targets, B image, **layer group**, loss+aggregation cfg, optimizer cfg → gradient steps minimizing the **group loss** (mean of per-layer normalized distances), early stopping → trained filter + convergence stats. |
 | Layer-group helper | `src/utils/layer_groups.py` | Encodes the group-based sweep: `LayerGroup` dataclass, range-syntax expansion (`"backbone.layer.0..3"`), explicit-group loader + auto-search generator (contiguous DINOv2 windows, `+proj`/`+dec`), `resolve_grid_groups()` union. Drives the automatic layer-search loop. |
 | Phase 1 diagnostics | `src/diagnostics.py` | Per-layer L2(normalized)+cosine distance per illumination level, aggregated mean±std over scenes → `results/phase1_diagnostics.json` + heatmap/line plots. Early-bailout if flat. (Diagnostics stay per-layer to guide group design.) |
@@ -95,6 +98,8 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 The full library is built upfront (scope expansion: the grid sweeps filter types too).
 All operate on the [0,1] RGB tensor before normalization, identity init = no-op.
 
+**Global filters** (one correction for the whole frame):
+
 | Filter | Params | Physics | Caveats |
 |--------|--------|---------|---------|
 | **Brightness** `I' = a·I + b` (global) | 2 | Exposure / illumination intensity | No per-channel / cross-channel |
@@ -106,10 +111,31 @@ All operate on the [0,1] RGB tensor before normalization, identity init = no-op.
 | **Matrix 3×3 + offset** `I' = M·I + b` | 12 | ISP CCM; cross-channel coupling | Still linear; no gamma/clipping |
 | **Composite** ordered chain | Σ | Combine linear + non-linear + color | Overfitting risk at high param count |
 
-Start with the cheap low-param filters (brightness / white-balance / affine) and the
-flagship linear (matrix); escalate to gamma + composites only if single filters plateau.
-`configs/grid.yaml::grid.filters` lists the active sweep; composites are commented out
-by default to keep the grid tractable (35 groups × N filters × 1 loss).
+**Spatially-varying filters** (zone-dependent correction; params vary smoothly across
+the frame via a bilinear K×K control grid upsampled with `grid_sample`). Match real
+illumination non-uniformity: vignetting, directional/uneven light, partial shadow,
+mixed sources. Params = `K² · n_field`; K configurable (default 2).
+
+| Filter | n_field | K=2 | K=3 | K=4 | Physics |
+|--------|---------|-----|-----|-----|---------|
+| `spatial_brightness` | 2 | 8 | 18 | 32 | Spatial exposure field |
+| `spatial_whitebalance` | 3 | 12 | 27 | 48 | Spatial color-temperature field |
+| `spatial_gamma` | 3 | 12 | 27 | 48 | Spatial non-linear tone field |
+| `spatial_affine` | 6 | 24 | 54 | 96 | Spatial WB + exposure field |
+
+**Scope note:** parameter count is **not** a constraint (see `2026-06-27-advanced-filters.md`).
+The real pressure is generalization: calibration fits against a single reference scene,
+so high-capacity filters (3D LUT, large-K spatial) can perfectly fit the calibration A/B
+pair and generalize badly to deployment B. **Held-out validation is the primary guardrail.**
+Smoothness/identity-anchoring regularization (`Filter.reg_loss()`, weighted by
+`training.reg_weight`) matters more than param count for high-capacity filters.
+
+The advanced library (F1–F7: 3D LUT, tone curves, high-order CCM, chromatic adaptation,
+spatial tone curve, local tone mapping, low-rank LUT) is specified in
+`docs/specs/2026-06-27-advanced-filters.md`. `configs/grid.yaml::grid.filters` lists the
+active sweep across both the initial and advanced libraries; the `overfit_gate`
+(`configs/grid.yaml::validation`) drops configs whose val recovery is too small a fraction
+of their train recovery.
 
 ## 7. Phased Execution (phases are blockers)
 
@@ -130,7 +156,7 @@ by default to keep the grid tractable (35 groups × N filters × 1 loss).
 1. **Phase 1:** ≥1 layer shows a clear distance gradient that scales with illumination shift.
 2. **Phase 2:** ≥1 **layer group** converges in <100 steps with ≥50% distance reduction on the held-out val set.
 3. **Phase 3:** top config recovers ≥70% of the proxy-agreement gap (filtered-B vs A predictions).
-4. **Calibration time:** <1 s on edge CPU (or <100 ms on GPU), <100 steps.
+4. **Calibration time:** <1 s on edge CPU (or <100 ms on GPU), <100 steps. (Parameter count is not a constraint; high-capacity filters are gated by held-out validation + `reg_loss`, not param budget.)
 
 ### Nice to Have
 - Which layer groups matter (early-backbone photometric windows vs projector+decoder semantic combos); the auto-search ranks contiguous DINOv2 windows by val distance.
@@ -139,17 +165,17 @@ by default to keep the grid tractable (35 groups × N filters × 1 loss).
 
 ### Acceptable Negative Results
 - No Phase 1 signal → model already invariant; redesign the shift or accept robustness.
-- 12-param barely beats 6-param → use affine (Occam's razor).
-- Proxy recovery <50% → shift too extreme or needs non-linear correction; escalate to curves/LUT tier.
+- A high-capacity filter (3D LUT, large-K spatial) overfits the calibration pair but fails the held-out val gate → drop it; the gate is working as intended.
+- Proxy recovery <50% → shift too extreme or needs a different filter family; inspect residuals (photometric vs geometric).
 
 ## 9. Decision Points & Contingencies
 
 | Scenario | Action |
 |----------|--------|
 | Phase 1 shows no signal | **STOP**; revisit shift / camera / dataset |
-| Signal in decoder only | Proceed cautiously; consider matrix-12 early; non-parametric may be needed |
-| Phase 2 baseline doesn't converge | Debug loss + LR; if still failing, shift may not be linearly separable |
-| Phase 2 overfits (train→0, val↑) | Lower LR / add L2 reg / early stop |
+| Signal in decoder only | Proceed cautiously; decoder layers are harder to optimize — high-capacity filters (3D LUT, high-order CCM) are defaults, not escalation |
+| Phase 2 baseline doesn't converge | Debug loss + LR; if still failing, shift may not be linearly separable — try a higher-capacity filter family |
+| Phase 2 overfits (train→0, val↑) | Raise `reg_weight` / lower capacity (smaller K/N/P/M) / earlier stopping — the `overfit_gate` surfaces this automatically |
 | Proxy recovery <50% | Inspect residuals: photometric (color cast) vs geometric (blur/focus) |
 | Calibration >1 s on edge | Reduce steps/batch; pre-calibrate offline if needed |
 

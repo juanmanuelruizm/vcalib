@@ -14,6 +14,8 @@ Filter library (params):
 - ``contrast_1param`` — scaling around image mean
 - ``gamma_3param`` — per-channel tone curve (non-linear)
 - ``matrix_12param`` — 3x3 CCM + offset (cross-channel)  [flagship linear]
+- ``spatial_brightness`` / ``spatial_whitebalance`` / ``spatial_affine`` / ``spatial_gamma``
+  — bilinear K×K control-grid variants of the above (zone-dependent; params = K²·n_field)
 - ``composite`` — ordered chain (variable params)
 """
 
@@ -29,6 +31,7 @@ from .contrast_1param import Contrast
 from .gamma_3param import Gamma
 from .matrix_12param import Matrix12Param
 from .saturation_1param import Saturation
+from .spatial import SpatialAffine, SpatialBrightness, SpatialGamma, SpatialWhiteBalance
 from .white_balance_3param import WhiteBalance
 
 __all__ = [
@@ -41,6 +44,10 @@ __all__ = [
     "Gamma",
     "Matrix12Param",
     "CompositeFilter",
+    "SpatialBrightness",
+    "SpatialWhiteBalance",
+    "SpatialAffine",
+    "SpatialGamma",
     "FILTER_REGISTRY",
     "get_filter",
     "make_composite",
@@ -54,6 +61,10 @@ FILTER_REGISTRY: Dict[str, Callable[[], Filter]] = {
     "contrast_1param": Contrast,
     "gamma_3param": Gamma,
     "matrix_12param": Matrix12Param,
+    "spatial_brightness": SpatialBrightness,
+    "spatial_whitebalance": SpatialWhiteBalance,
+    "spatial_affine": SpatialAffine,
+    "spatial_gamma": SpatialGamma,
 }
 
 
@@ -75,6 +86,7 @@ def build_filter(spec: Union[str, Sequence[str], Dict[str, object]]) -> Filter:
     - ``"affine_6param"`` -> single filter
     - ``["affine_6param", "gamma_3param"]`` -> composite (ordered chain)
     - ``{"type": "affine_6param", "params": 6}`` -> single (params ignored)
+    - ``{"type": "spatial_affine", "grid_size": 3}`` -> spatial filter with K=3
     - ``{"composite": ["affine_6param", "gamma_3param"]}`` -> composite
     """
     if isinstance(spec, str):
@@ -84,5 +96,10 @@ def build_filter(spec: Union[str, Sequence[str], Dict[str, object]]) -> Filter:
     if isinstance(spec, dict):
         if "composite" in spec:
             return make_composite(list(cast(Sequence[str], spec["composite"])))
-        return get_filter(str(spec["type"]))
+        name = str(spec["type"])
+        if name not in FILTER_REGISTRY:
+            raise KeyError(f"Unknown filter {name!r}. Valid: {sorted(FILTER_REGISTRY)}")
+        kwargs = {k: v for k, v in spec.items() if k not in ("type", "params")}
+        cls = FILTER_REGISTRY[name]
+        return cls(**kwargs)
     raise TypeError(f"Unsupported filter spec type: {type(spec)}")

@@ -2,7 +2,7 @@
 
 ## What Is This
 
-A research framework to develop and validate a learnable parametric filter (6–12 parameters) that corrects illumination shifts in RF-DETR real-time object detection. Goal: recover mAP performance when deployed under different lighting without retraining the model. Constraint: small enough to calibrate on edge in seconds.
+A research framework to develop and validate a learnable **differentiable** preprocessing filter that corrects illumination shifts in RF-DETR real-time object detection. Goal: recover mAP performance when deployed under different lighting without retraining the model. **Parameter count is not a constraint; the primary guardrail is held-out validation generalization.** Calibration runs on edge in seconds, with no model retraining. See `docs/specs/2026-06-27-advanced-filters.md` for the expressiveness-first filter philosophy.
 
 ## Stack
 
@@ -10,7 +10,9 @@ A research framework to develop and validate a learnable parametric filter (6–
 - **Model loader:** LibreYOLO (git submodule at `3rd_party/libreyolo`, v1.2.0.dev0) — `from libreyolo import LibreRFDETR; LibreRFDETR(size="n")`. Pulls `transformers>=5.1` for the DINOv2 backbone only. RF-DETR nano weights auto-download to `3rd_party/libreyolo/weights/rf-detr-nano.pth`.
 - **Activation access:** LibreYOLO does **not** expose `output_hidden_states` through its wrapper. The internal model is `libre.model.model` (an `LWDETR`); activations are captured with **PyTorch `register_forward_hook`** on submodules. Canonical layer names (see `src/utils/activations.py::LAYER_PATHS`): `backbone.layer.0..11` (12 DINOv2 ViT blocks), `backbone.projector` (multi-scale projector = encoder memory), `decoder.layer.0..1`.
 - **Filter insertion point:** the [0,1] RGB tensor **before** ImageNet mean/std normalization (confirmed by inspecting LibreYOLO's `preprocess_numpy`).
-- **Filter library:** `src/filters/` — all filters operate on [0,1] NCHW RGB, identity init = no-op, output clamped to [0,1], params in a physical range. `FILTER_REGISTRY` + `get_filter(name)` / `build_filter(spec)` instantiate by name for the grid. Library: `brightness_2param`, `white_balance_3param`, `affine_6param`, `saturation_1param`, `contrast_1param`, `gamma_3param`, `matrix_12param`, plus `CompositeFilter` (ordered chain). Scope expanded from "start at 6, escalate later" to "full library built upfront so the grid sweeps filter types too."
+- **Filter library:** `src/filters/` — all filters operate on [0,1] NCHW RGB, identity init = no-op, output clamped to [0,1], params in a physical range, end-to-end differentiable. `FILTER_REGISTRY` + `get_filter(name)` / `build_filter(spec)` instantiate by name for the grid. **Initial library (A3):** `brightness_2param`, `white_balance_3param`, `affine_6param`, `saturation_1param`, `contrast_1param`, `gamma_3param`, `matrix_12param`, `CompositeFilter` (chain). **Advanced library (A9–A15, see `docs/specs/2026-06-27-advanced-filters.md`):** 3D LUT (`lut_3d`), per-channel monotone tone curves (`tone_curve`), high-order/root-polynomial CCM (`ccm_high_order`), LMS/Bradford chromatic adaptation (`chromatic_adaptation`), large-K spatial tone curve (`spatial_tone_curve`), CLAHE-like local tone mapping (`local_tonemap`), low-rank 3D LUT (`lut_3d_lowrank`). The library spans low- to high-capacity filters; **filter type is a grid axis, not an escalation ladder.**
+- **Filter regularization:** `Filter.reg_loss() -> Tensor` (default 0; high-capacity filters override with TV/smoothness + identity-anchoring). The calibration loop adds `reg_weight * filter.reg_loss()` to the group loss (`configs/grid.yaml::training.reg_weight`). This matters more than param count for high-capacity filters.
+- **Spatial filters:** `src/filters/spatial.py` — zone-dependent variants (`spatial_brightness`, `spatial_whitebalance`, `spatial_affine`, `spatial_gamma`) via a bilinear K×K control grid upsampled with `grid_sample`. Params = `K²·n_field` (K=2→8/12/12/24; K=3→18/27/27/54). For non-uniform illumination (vignetting/directional light/shadow). K controls spatial precision (informational); larger K raises overfitting risk on a single calibration scene, gated by held-out val.
 - **Package manager:** uv (fast, reproducible)
 - **Compute:** GPU optional (CUDA if available; CPU fallback for diagnostics)
 - **Dev tools:** pytest, mypy, ruff (linting + formatting)
@@ -45,7 +47,7 @@ uv run python src/diagnostics.py --dataset-path data/raw/ --debug --plot
 ## Conventions
 
 - **Naming:** `kebab-case` for files, `snake_case` for Python functions/vars, `PascalCase` for classes
-- **Filter names:** `affine_6param.py`, `matrix_12param.py` (explicit parameter count)
+- **Filter names:** initial library uses explicit parameter count (`affine_6param.py`, `matrix_12param.py`). Advanced filters (A9–A15) use descriptive names without a count (`lut_3d.py`, `tone_curve.py`, `ccm_high_order.py`, …) since param count is no longer fixed (varies with `size`/`P`/`grid_size`/`degree`/`M`). Existing count-suffixed names are kept (no rename).
 - **Commits:** Conventional Commits (`feat: add X`, `fix: resolve Y`, `refactor: Z`); one commit per completed phase/task
 - **Config files:** YAML in `configs/`; versioned, never hardcoded hyperparams
 - **Results:** Always save to `results/runs.csv` with timestamp + config hash for reproducibility
@@ -60,8 +62,8 @@ uv run python src/diagnostics.py --dataset-path data/raw/ --debug --plot
 2. **Write code against the plan** — don't explore mid-implementation
 
 3. **Test before committing:**
-   - Diagnostic phase: `npm test`
-   - Grid phase: `npm run benchmark --subset 5` (5 quick runs, not all 18)
+   - Diagnostic phase: `uv run pytest tests/ -v`
+   - Grid phase: `uv run python src/grid_search.py --config configs/grid.yaml --subset 5` (5 quick runs, not all 35 groups × ~15 filters)
    - Full verification only when claiming done
 
 4. **Commit per completed task** (in `tasks/todo.md`), never per-file
@@ -81,8 +83,7 @@ uv run python src/diagnostics.py --dataset-path data/raw/ --debug --plot
 
 ### Phase 2 (Grid Search)
 - **Loss is computed over GROUPS of layers, not a single layer.** The group loss = mean of per-layer normalized L2 (`||a-b||/||a||`) across all layers in the group (see `configs/grid.yaml::loss`). Groups are encoded declaratively — explicit baselines (`layer_groups`) + auto-generated contiguous DINOv2 windows (`layer_group_search`) — and resolved by `src/utils/layer_groups.py::resolve_grid_groups()`. Run `uv run python src/utils/layer_groups.py --dump` to see the resolved candidate groups; this is what the automatic layer-search loop iterates.
-- **Overfitting risk.** 20–30 scenes × 1 filter config = you're fitting to the specific pairs. Always hold out a validation subset before calling a config "optimal."
-- **Don't add parameters you don't need.** If 6 params (affine) plateau at 80% mAP recovery, jumping to 12 (matrix) likely won't help much; investigate residuals instead.
+- **Held-out validation is the primary guardrail, not parameter count.** Calibration fits against a single reference scene, so high-capacity filters (3D LUT, large-K spatial) can perfectly fit the calibration A/B pair and generalize badly to deployment B. Always rank configs by val distance; the `overfit_gate` (`configs/grid.yaml::validation`) drops configs whose val recovery is too small a fraction of their train recovery. Smoothness/identity-anchoring regularization (`Filter.reg_loss()`, weighted by `training.reg_weight`) matters more than param count.
 - **Loss function rarely matters.** L2 vs. cosine usually <5% difference; don't waste grid dimension on this unless Phase 1 shows extreme outliers.
 
 ### Phase 3 (Benchmark)

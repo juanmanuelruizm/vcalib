@@ -55,10 +55,21 @@ grid:
     # Flagship linear (spec baselines)
     - type: "affine_6param"
     - type: "matrix_12param"
+    # Spatially-varying (zone-dependent illumination; bilinear K×K control grid).
+    # Params = K²·n_field. K=2 default; override with grid_size for finer control
+    # (e.g. {type: spatial_affine, grid_size: 3}). Use the smallest K that recovers
+    # the distance — escalate only if a global filter plateaus.
+    - type: "spatial_brightness"      # K=2 -> 8 params
+    - type: "spatial_whitebalance"    # K=2 -> 12 params
+    - type: "spatial_gamma"           # K=2 -> 12 params
+    - type: "spatial_affine"          # K=2 -> 24 params
+    # - type: "spatial_affine"
+    #   grid_size: 3                  # K=3 -> 54 params (finer zones, higher calib cost)
     # Composites (escalate if single filters plateau; non-linear residuals)
     # - composite: ["affine_6param", "gamma_3param"]      # 9 params: linear + tone
     # - composite: ["matrix_12param", "gamma_3param"]     # 15 params: CCM + tone
     # - composite: ["affine_6param", "saturation_1param"] # 7 params: WB + vividness
+    # - composite: ["spatial_affine", "gamma_3param"]     # 27 params: spatial + tone
 
   loss_functions:
     - "l2"                                   # L2 (primary)

@@ -62,3 +62,13 @@ class Filter(nn.Module):
         """Return constrained parameters as a 1-D tensor (for logging / CSV)."""
         parts = [v.reshape(-1) for v in self.get_params().values()]
         return torch.cat(parts) if parts else torch.tensor([])
+
+    def reg_loss(self) -> torch.Tensor:
+        """Regularization term added to the calibration loss (default: zero).
+
+        High-capacity filters (3D LUT, tone curves, large-K spatial) override this with
+        smoothness (total-variation / curvature) + identity-anchoring penalties. The
+        calibration loop adds ``reg_weight * filter.reg_loss()`` to the group loss.
+        """
+        dev = next(self.parameters()).device
+        return torch.zeros((), device=dev)

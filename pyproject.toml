@@ -49,6 +49,9 @@ libreyolo = { path = "3rd_party/libreyolo" }
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
+markers = [
+    "slow: tests that load the RF-DETR model or run full calibration (tens of seconds)",
+]
 
 [tool.mypy]
 python_version = "3.13"

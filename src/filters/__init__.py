@@ -26,12 +26,19 @@ from typing import Callable, Dict, List, Sequence, Union, cast
 from .affine_6param import Affine6Param
 from .base import Filter
 from .brightness_2param import Brightness
+from .ccm_high_order import HighOrderCCM
+from .chromatic_adaptation import ChromaticAdaptation
 from .composite import CompositeFilter
 from .contrast_1param import Contrast
 from .gamma_3param import Gamma
+from .local_tonemap import LocalTonemap
+from .lut_3d import LUT3D
+from .lut_3d_lowrank import LUT3DLowRank
 from .matrix_12param import Matrix12Param
 from .saturation_1param import Saturation
 from .spatial import SpatialAffine, SpatialBrightness, SpatialGamma, SpatialWhiteBalance
+from .spatial_tone_curve import SpatialToneCurve
+from .tone_curve import ToneCurve
 from .white_balance_3param import WhiteBalance
 
 __all__ = [
@@ -48,6 +55,13 @@ __all__ = [
     "SpatialWhiteBalance",
     "SpatialAffine",
     "SpatialGamma",
+    "LUT3D",
+    "ToneCurve",
+    "HighOrderCCM",
+    "ChromaticAdaptation",
+    "SpatialToneCurve",
+    "LocalTonemap",
+    "LUT3DLowRank",
     "FILTER_REGISTRY",
     "get_filter",
     "make_composite",
@@ -65,6 +79,13 @@ FILTER_REGISTRY: Dict[str, Callable[[], Filter]] = {
     "spatial_whitebalance": SpatialWhiteBalance,
     "spatial_affine": SpatialAffine,
     "spatial_gamma": SpatialGamma,
+    "lut_3d": LUT3D,
+    "tone_curve": ToneCurve,
+    "ccm_high_order": HighOrderCCM,
+    "chromatic_adaptation": ChromaticAdaptation,
+    "spatial_tone_curve": SpatialToneCurve,
+    "local_tonemap": LocalTonemap,
+    "lut_3d_lowrank": LUT3DLowRank,
 }
 
 

@@ -40,12 +40,25 @@ layer_group_search:
   singletons: false
 
 # --- Grid axes crossed with each resolved layer group ---
+# Filter library (see src/filters/__init__.py::FILTER_REGISTRY). The grid sweeps
+# layer_group x filter x loss. Comment out filters to trim the sweep cost
+# (35 groups x N filters x 1 loss). Composites chain corrections a single filter
+# cannot express (linear + non-linear + color), e.g. affine -> gamma -> saturation.
 grid:
   filters:
+    # Simple / low-param (cheap baselines)
+    - type: "brightness_2param"
+    - type: "white_balance_3param"
+    - type: "saturation_1param"
+    - type: "contrast_1param"
+    - type: "gamma_3param"
+    # Flagship linear (spec baselines)
     - type: "affine_6param"
-      params: 6
     - type: "matrix_12param"
-      params: 12
+    # Composites (escalate if single filters plateau; non-linear residuals)
+    # - composite: ["affine_6param", "gamma_3param"]      # 9 params: linear + tone
+    # - composite: ["matrix_12param", "gamma_3param"]     # 15 params: CCM + tone
+    # - composite: ["affine_6param", "saturation_1param"] # 7 params: WB + vividness
 
   loss_functions:
     - "l2"                                   # L2 (primary)

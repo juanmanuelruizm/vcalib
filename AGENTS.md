@@ -76,6 +76,7 @@ uv run python src/diagnostics.py --dataset-path data/raw/ --debug --plot
 - **More illumination levels beats more scenes.** 3–5 intensity steps (uniform progression between A and B) catch non-linearity; 2 extremes are too sparse.
 - **Pair images **exactly**: same camera, tripod, same framing, only light changes. Even 1° of rotation breaks alignment.
 - **Don't skip ground truth.** Without bounding box labels on condition B, you can't compute true mAP; proxies (IoU agreement with A) are weak signals.
+- **Data layout** (consumed by `src/utils/data_pairs.py::discover_pairs`): `data/raw/scenes_YYYYMMDD/scene_001/level_1.jpg` (A=reference) + `level_2.jpg`…`level_N.jpg` (B=shift levels). Held-out val split is **by scene** (entire scenes held out, not individual levels). Calibration scene: `data/raw/calibration_scene/reference.jpg`.
 
 ### Phase 1 (Diagnostics)
 - **Early bailout if no signal.** If distance curve is flat across all layers (model already invariant), stop. Spend time on a harder shift or different camera/object type.
@@ -113,4 +114,4 @@ uv run python src/diagnostics.py --dataset-path data/raw/ --debug --plot
 
 **Project Owner:** Carlos  
 **Last Updated:** 2026-06-27  
-**Status:** Planning phase — specs + task list written; code not yet started
+**Status:** Phase A complete — all code built & verified (211 tests, 18 filters, calibration loop, data loader, diagnostics, grid executor). Ready for Phase 0 capture → Phase 1 diagnostics → Phase 2 grid search.

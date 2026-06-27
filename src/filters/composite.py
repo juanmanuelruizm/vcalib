@@ -34,6 +34,14 @@ class CompositeFilter(Filter):
     def num_params(self) -> int:
         return int(sum(f.num_params for f in self.filters))
 
+    def reg_loss(self) -> torch.Tensor:
+        """Sum of sub-filters' reg_loss() (propagates regularization through the chain)."""
+        total = None
+        for f in self.filters:
+            r = f.reg_loss()
+            total = r if total is None else total + r
+        return total if total is not None else torch.zeros(())
+
     def get_params(self) -> Dict[str, torch.Tensor]:
         out: Dict[str, torch.Tensor] = {}
         for i, f in enumerate(self.filters):

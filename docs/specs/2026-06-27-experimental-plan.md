@@ -31,10 +31,10 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 1. **Aligned pairs.** Position-for-position comparable activations require identical framing; only light differs.
 2. **Reference A precomputed offline.** Store A's target activations once; at deploy time only B is seen and pulled toward stored A.
 3. **Filter edits pixels, not activations.** Per-channel affine (6 params) or 3×3 matrix + offset (12 params), operating on the 0–1 RGB tensor before the model's normalization.
-4. **Layer chosen by the diagnostic sweep**, not assumed up front.
+4. **Layer chosen by the diagnostic sweep, evaluated over GROUPS of layers.** The loss aggregates a per-layer distance across all layers in a group, not at a single layer. Groups are encoded declaratively (explicit baselines + auto-generated contiguous-window candidates) in `configs/grid.yaml` and resolved by `src/utils/layer_groups.py`, so an automatic layer-search loop can iterate candidate groups.
 5. **Goal = deployable on-edge tool** (calibrate in seconds), not just a research report.
 6. **Metric = proxy.** Agreement with A's predictions (box IoU + class agreement). No true mAP / ground-truth labeling.
-7. **Model = HuggingFace transformers RF-DETR** (`rf-detr-nano`, merged into transformers 2026-05-07; `output_hidden_states=True` exposes hidden states). Roboflow `rfdetr` is the fallback. Verify activation access as task one.
+7. **Model loader = LibreYOLO** (git submodule at `3rd_party/libreyolo`, v1.2.0.dev0): `from libreyolo import LibreRFDETR; LibreRFDETR(size="n")`. The wrapper exposes a native `LWDETR` port (not HuggingFace `RfDetrForObjectDetection`); it pulls `transformers>=5.1` only for the DINOv2 backbone. **Activation access is via PyTorch `register_forward_hook`** on submodules of `libre.model.model` — `output_hidden_states` is not reachable through the wrapper. Verified layer names: `backbone.layer.0..11` (12 DINOv2 ViT blocks), `backbone.projector` (multi-scale projector = encoder memory), `decoder.layer.0..1` (nano has 2 decoder layers). See `src/utils/activations.py::LAYER_PATHS`.
 
 ## 4. Two Distinct Datasets (important)
 
@@ -72,18 +72,19 @@ The activations are the **loss signal only**; the filter edits the RGB image.
 
 | Component | File | Role |
 |-----------|------|------|
-| Activation helper | `src/utils/activations.py` | Load frozen `rf-detr-nano`; `extract_activations(image)` → named layer dict via `output_hidden_states=True`; cache/load to `data/processed/activations_cache/`. **Task one: dump real layer names/shapes.** |
+| Activation helper | `src/utils/activations.py` | Load frozen RF-DETR nano via LibreYOLO; `extract_activations(image)` → named layer dict via **PyTorch forward hooks** on `libre.model.model` submodules (LibreYOLO does not expose `output_hidden_states`); cache/load to `data/processed/activations_cache/`. Real layer names: `backbone.layer.0..11`, `backbone.projector`, `decoder.layer.0..1`. |
 | Affine filter | `src/filters/affine_6param.py` | `Affine6Param(nn.Module)`: gains `a_c∈[0.1,2.0]`, offsets `b_c∈[-1,1]`, identity init, `forward(x)→clamp[0,1]`, `get_params()`. |
 | Matrix filter | `src/filters/matrix_12param.py` | `Matrix12Param(nn.Module)`: `I' = M·I + b`, M init = identity. Same pixel-space contract. |
-| Calibration loop | `src/calibration.py` (new) | Core loop shared by grid search + deployed tool: given filter, stored A-targets, B image, layer, loss, optimizer cfg → gradient steps minimizing activation distance, early stopping → trained filter + convergence stats (steps, wall-clock, final loss). |
-| Phase 1 diagnostics | `src/diagnostics.py` | Per-layer L2(normalized)+cosine distance per illumination level, aggregated mean±std over scenes → `results/phase1_diagnostics.json` + heatmap/line plots. Early-bailout if flat. |
-| Phase 2 grid | `src/grid_search.py` | Sweep layer × filter × loss from `configs/grid.yaml`; train via `calibration.py` on dev-train; measure distance reduction on dev-val; log `results/runs.csv` (+ `config_hash`, timestamp); checkpoint top configs. |
+| Calibration loop | `src/calibration.py` (new) | Core loop shared by grid search + deployed tool: given filter, stored A-targets, B image, **layer group**, loss+aggregation cfg, optimizer cfg → gradient steps minimizing the **group loss** (mean of per-layer normalized distances), early stopping → trained filter + convergence stats. |
+| Layer-group helper | `src/utils/layer_groups.py` | Encodes the group-based sweep: `LayerGroup` dataclass, range-syntax expansion (`"backbone.layer.0..3"`), explicit-group loader + auto-search generator (contiguous DINOv2 windows, `+proj`/`+dec`), `resolve_grid_groups()` union. Drives the automatic layer-search loop. |
+| Phase 1 diagnostics | `src/diagnostics.py` | Per-layer L2(normalized)+cosine distance per illumination level, aggregated mean±std over scenes → `results/phase1_diagnostics.json` + heatmap/line plots. Early-bailout if flat. (Diagnostics stay per-layer to guide group design.) |
+| Phase 2 grid | `src/grid_search.py` | Sweep **layer group** × filter × loss from `configs/grid.yaml` (groups resolved via `layer_groups.py`); train via `calibration.py` on dev-train; measure distance reduction on dev-val; log `results/runs.csv` (`group_name`, filter, loss, ...); checkpoint top configs. |
 | Phase 3 benchmark | `src/benchmark.py` | Top configs: model on B with/without filter; proxy metric vs A's predictions (IoU + class agreement); calibration cost → `results/runs_phase3.csv` + `docs/phase3_report.md`. |
 | Deploy CLI | `src/deploy_calibrate.py` (new) | Store A-targets of calibration scene → re-shoot under B → run `calibration.py` → freeze filter (<1MB) → ready for inference. |
 
 ### Loss & training
-- Distance at chosen layer between filtered-B and stored-A activations: normalized L2 (primary),
-  cosine (secondary, deferred unless Phase 1 shows extremes).
+- **Group loss:** the loss is computed over a **group of layers**, not a single layer. For each layer in the group, a per-layer normalized distance is computed — `l2_rel = ||a-b||_2 / ||a||_2` (primary) — so layers of heterogeneous shape (backbone `(4,145,384)`, projector `(1,256,24,24)`, decoder `(1,300,256)`) contribute on a comparable scale. The group loss aggregates them via `mean` (default) or `sum` (see `configs/grid.yaml::loss`).
+- **Layer groups** come from two sources, unioned (explicit baselines win on collisions): (1) hand-curated named groups in `layer_groups` (e.g. `backbone.early` = blocks 0..3, `encoder+decoder`); (2) auto-generated candidates in `layer_group_search` (contiguous DINOv2 windows of configurable sizes/stride, optionally `+proj`/`+dec`). Resolve with `src/utils/layer_groups.py::resolve_grid_groups()`. This is the encoding the automatic layer-search loop consumes.
 - Adam, lr 1e-3, max 100 steps, early-stop patience 10.
 - Seed `torch.manual_seed` + split seed for bitwise-reproducible reruns.
 
@@ -105,8 +106,8 @@ Start at 6 params; escalate to 12 only if Phase 2 shows systematic residuals.
 3. (This rewrite.) Spec + `tasks/todo.md` reflect the tool reframing.
 4. Finalize the capture protocol (fixed calibration scene + dev dataset).
 
-**Phase 1 — Diagnostics** (after dev dataset captured) → pick candidate layer(s).
-**Phase 2 — Grid search** → pick filter + layer, validated on held-out split.
+**Phase 1 — Diagnostics** (after dev dataset captured) → per-layer distance map to inform group design.
+**Phase 2 — Grid search** → sweep **layer group** × filter × loss; auto-search loop ranks candidate groups; pick filter + group, validated on held-out split.
 **Phase 3 — Benchmark** → proxy recovery + calibration cost; recommend deploy config.
 **Phase D — Deployable tool** → `src/deploy_calibrate.py` runtime calibration story.
 
@@ -114,12 +115,12 @@ Start at 6 params; escalate to 12 only if Phase 2 shows systematic residuals.
 
 ### Must Have
 1. **Phase 1:** ≥1 layer shows a clear distance gradient that scales with illumination shift.
-2. **Phase 2:** ≥1 config converges in <100 steps with ≥50% distance reduction on the held-out val set.
+2. **Phase 2:** ≥1 **layer group** converges in <100 steps with ≥50% distance reduction on the held-out val set.
 3. **Phase 3:** top config recovers ≥70% of the proxy-agreement gap (filtered-B vs A predictions).
 4. **Calibration time:** <1 s on edge CPU (or <100 ms on GPU), <100 steps.
 
 ### Nice to Have
-- Which layers matter (early backbone photometric vs decoder semantic).
+- Which layer groups matter (early-backbone photometric windows vs projector+decoder semantic combos); the auto-search ranks contiguous DINOv2 windows by val distance.
 - Generalization to unseen illumination levels (train on levels 2–4, test 1 & 5).
 - Overfitting signature: train loss vs val distance gap.
 
@@ -141,8 +142,9 @@ Start at 6 params; escalate to 12 only if Phase 2 shows systematic residuals.
 
 ## 10. Open Items to Confirm During Execution
 
-- Exact real layer names from RF-DETR nano (placeholders `backbone_3` / `encoder_output` in `configs/grid.yaml` will change).
-- Whether the filter sits strictly pre-normalization (assumed) vs on the processor's normalized tensor — decided once the HF image-processor pipeline is inspected in task one.
+- ~~Exact real layer names from RF-DETR nano~~ — **resolved (A1):** `backbone.layer.0..11`, `backbone.projector`, `decoder.layer.0..1`; placeholders in `configs/grid.yaml` replaced (now encoded as layer groups, not single layers).
+- ~~Whether the filter sits strictly pre-normalization vs on the processor's normalized tensor~~ — **resolved (A1):** filter operates on the [0,1] RGB tensor before ImageNet mean/std normalization (confirmed via LibreYOLO's `preprocess_numpy`).
+- **Layer-group sweep encoding** — the loss is computed over **groups of layers** (mean of per-layer normalized L2). Encoded in `configs/grid.yaml` (`layer_groups` + `layer_group_search`) and resolved by `src/utils/layer_groups.py`, enabling an automatic layer-search loop.
 
 ## 11. References
 

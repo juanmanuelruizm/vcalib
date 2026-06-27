@@ -7,7 +7,9 @@ A research framework to develop and validate a learnable parametric filter (6–
 ## Stack
 
 - **Language:** Python 3.10+
-- **Framework:** PyTorch + HuggingFace transformers (v5.1+, RF-DETR)
+- **Model loader:** LibreYOLO (git submodule at `3rd_party/libreyolo`, v1.2.0.dev0) — `from libreyolo import LibreRFDETR; LibreRFDETR(size="n")`. Pulls `transformers>=5.1` for the DINOv2 backbone only. RF-DETR nano weights auto-download to `3rd_party/libreyolo/weights/rf-detr-nano.pth`.
+- **Activation access:** LibreYOLO does **not** expose `output_hidden_states` through its wrapper. The internal model is `libre.model.model` (an `LWDETR`); activations are captured with **PyTorch `register_forward_hook`** on submodules. Canonical layer names (see `src/utils/activations.py::LAYER_PATHS`): `backbone.layer.0..11` (12 DINOv2 ViT blocks), `backbone.projector` (multi-scale projector = encoder memory), `decoder.layer.0..1`.
+- **Filter insertion point:** the [0,1] RGB tensor **before** ImageNet mean/std normalization (confirmed by inspecting LibreYOLO's `preprocess_numpy`).
 - **Package manager:** uv (fast, reproducible)
 - **Compute:** GPU optional (CUDA if available; CPU fallback for diagnostics)
 - **Dev tools:** pytest, mypy, ruff (linting + formatting)
@@ -77,6 +79,7 @@ uv run python src/diagnostics.py --dataset-path data/raw/ --debug --plot
 - **Distinguish backbone vs. encoder vs. decoder.** Early backbone layers are best for photometric correction; decoder layers are too abstract and harder to optimize.
 
 ### Phase 2 (Grid Search)
+- **Loss is computed over GROUPS of layers, not a single layer.** The group loss = mean of per-layer normalized L2 (`||a-b||/||a||`) across all layers in the group (see `configs/grid.yaml::loss`). Groups are encoded declaratively — explicit baselines (`layer_groups`) + auto-generated contiguous DINOv2 windows (`layer_group_search`) — and resolved by `src/utils/layer_groups.py::resolve_grid_groups()`. Run `uv run python src/utils/layer_groups.py --dump` to see the resolved candidate groups; this is what the automatic layer-search loop iterates.
 - **Overfitting risk.** 20–30 scenes × 1 filter config = you're fitting to the specific pairs. Always hold out a validation subset before calling a config "optimal."
 - **Don't add parameters you don't need.** If 6 params (affine) plateau at 80% mAP recovery, jumping to 12 (matrix) likely won't help much; investigate residuals instead.
 - **Loss function rarely matters.** L2 vs. cosine usually <5% difference; don't waste grid dimension on this unless Phase 1 shows extreme outliers.
@@ -99,8 +102,8 @@ uv run python src/diagnostics.py --dataset-path data/raw/ --debug --plot
 
 ## References
 
-- **RF-DETR docs:** https://huggingface.co/docs/transformers/model_doc/rf_detr
-- **Hooks into HuggingFace models:** https://huggingface.co/docs/transformers/en/internal/modeling_outputs
+- **LibreYOLO (model loader):** https://github.com/LibreYOLO/libreyolo — `LibreRFDETR` wraps RF-DETR with DINOv2 backbone; internal `LWDETR` at `libre.model.model`.
+- **RF-DETR docs (HF transformers, backbone only):** https://huggingface.co/docs/transformers/model_doc/rf_detr
 - **Color correction theory (ISP CCM):** See `docs/` for references on white balance, sensor gain, cross-channel crosstalk
 - **Phase plan details:** See `docs/specs/2026-06-27-experimental-plan.md` (frozen spec before implementation)
 

@@ -1,33 +1,46 @@
-"""Full 3x3 matrix + offset filter: I' = M @ I + b."""
+"""Full 3x3 color-correction matrix + offset filter (12 params): I' = M @ I + b.
+
+The flagship linear filter with cross-channel coupling. Covers: ISP color-correction
+matrix (CCM), white balance, cross-channel crosstalk, metamerism. ``M`` init = identity
+and ``b`` init = 0 (identity = no-op). Still linear, so it cannot model gamma/clipping
+residuals — pair with :class:`Gamma` via :class:`CompositeFilter` for that.
+"""
+
+from __future__ import annotations
+
+from typing import Dict
 
 import torch
 import torch.nn as nn
 
+from .base import Filter, clamp_param
 
-class Matrix12Param(nn.Module):
-    """
-    Learnable 3x3 color correction matrix (CCM) + offset.
+MATRIX_RANGE = (-2.0, 2.0)
+OFFSET_RANGE = (-1.0, 1.0)
 
-    Maps: I' = M @ I + b, where M is 3x3 and b is 3-dim offset.
-    Covers: color mixing, white balance, cross-channel coupling, exposure.
-    12 parameters total (9 matrix + 3 offset).
-    """
 
-    def __init__(self, init_identity: bool = True):
+class Matrix12Param(Filter):
+    """Learnable 3x3 CCM + offset: ``I' = M @ I + b`` (12 params)."""
+
+    def __init__(self, init_identity: bool = True) -> None:
         super().__init__()
-        # TODO: Implement initialization
-        # - matrix: 3x3, initialized to identity if init_identity
-        # - offset: 3-dim, initialized to zero if init_identity
+        if init_identity:
+            m_init = torch.eye(3)
+            b_init = torch.zeros(3)
+        else:
+            m_init = torch.zeros(3, 3)
+            b_init = torch.full((3,), 0.5 * (OFFSET_RANGE[0] + OFFSET_RANGE[1]))
+        self.matrix = nn.Parameter(m_init)
+        self.offset = nn.Parameter(b_init)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply matrix transformation to input image."""
-        # TODO: Implement forward pass
-        # x: (B, 3, H, W) or (B, H, W, 3) in [0, 1]
-        # Reshape x to apply matrix multiply
-        # return: transformed image, clamped to [0, 1]
-        pass
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        m = clamp_param(self.matrix, *MATRIX_RANGE)
+        b = clamp_param(self.offset, *OFFSET_RANGE).view(1, 3, 1, 1)
+        # x: (B, 3, H, W) -> apply 3x3 over the channel dim.
+        return torch.einsum("cd,bdhw->bchw", m, x) + b
 
-    def get_params(self) -> dict:
-        """Return current parameters."""
-        # TODO: Return matrix and offset as dict
-        pass
+    def get_params(self) -> Dict[str, torch.Tensor]:
+        return {
+            "matrix": clamp_param(self.matrix, *MATRIX_RANGE).detach(),
+            "offset": clamp_param(self.offset, *OFFSET_RANGE).detach(),
+        }

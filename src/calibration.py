@@ -21,7 +21,7 @@ from __future__ import annotations
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -483,6 +483,7 @@ def calibrate_epochs(
     model: Any,
     cfg: Optional[CalibrationConfig] = None,
     test_pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+    on_epoch_end: Optional[Callable[[int, float, Optional[float], torch.nn.Module], None]] = None,
 ) -> Tuple[torch.nn.Module, CalibrationResult]:
     """Train ``filt`` on MULTIPLE A/B pairs with an epoch-based loop.
 
@@ -499,6 +500,10 @@ def calibrate_epochs(
         cfg: Hyperparameters. ``cfg.max_epochs`` sets the epoch limit (required).
             ``cfg.early_stopping_patience`` is patience in epochs.
         test_pairs: Optional held-out pairs for val-based early stopping.
+        on_epoch_end: Optional callback called at the end of each epoch with
+            ``(epoch, train_loss, val_loss_or_None, filt)``. Use it to log
+            metrics or save checkpoints without coupling this function to any
+            specific logging framework.
 
     Returns:
         (trained filter, CalibrationResult). ``result.steps`` = total optimizer steps.
@@ -581,6 +586,9 @@ def calibrate_epochs(
             val_history.append(v_loss)
             if baseline_val is None:
                 baseline_val = v_loss
+
+        if on_epoch_end is not None:
+            on_epoch_end(epoch, epoch_train_loss, v_loss, filt)
 
         # Early stopping (epoch-level)
         monitor = v_loss if v_loss is not None else epoch_train_loss

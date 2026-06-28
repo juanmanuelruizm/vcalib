@@ -1,0 +1,19 @@
+name: p2_lut3d_reg0001_lv2
+dataset: data/datasets/level_1_vs_level_2
+input_size: 384
+filter:
+  type: lut_3d
+  size: 9
+layer_group:
+  name: phase2_group
+  layers:
+  - backbone.projector
+training:
+  max_epochs: 50
+  learning_rate: 0.005
+  reg_weight: 0.001
+  early_stopping_patience: 10
+  seed: 42
+  checkpoint_every: 10
+output:
+  results_dir: results/experiments

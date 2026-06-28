@@ -75,6 +75,8 @@ class CalibrationConfig:
     aggregation: str = "mean"  # "mean" | "sum"
     seed: int = 42
     log_every: int = 10
+    loss_mode: str = "activation"  # "activation" | "combined" | "detection"
+    detection_weight: float = 1.0  # β in combined mode
 
 
 @dataclass
@@ -184,6 +186,57 @@ def _forward_filtered(
     with _grad_hooks(model, layer_names) as acts:
         model.model(_make_nested_tensor(normed))
     return cast(Dict[str, torch.Tensor], acts)
+
+
+def _reference_with_detection(
+    model: Any,
+    unit_image: torch.Tensor,
+    layer_names: Sequence[str],
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Like compute_reference_activations but also returns detached detection output.
+
+    Same DINOv2 inplace-op workaround: no torch.no_grad().
+    """
+    dev = _model_device(model)
+    dtype = next(model.model.parameters()).dtype
+    x = _normalize_batch(unit_image.unsqueeze(0).to(dev, dtype), dev, dtype)
+    with _grad_hooks(model, layer_names) as acts:
+        det_out = model.model(_make_nested_tensor(x))
+    acts_detached = {k: v.detach().clone() for k, v in acts.items()}
+    det_detached = {k: v.detach() for k, v in det_out.items() if isinstance(v, torch.Tensor)}
+    return acts_detached, det_detached
+
+
+def _forward_filtered_full(
+    model: Any,
+    filt: torch.nn.Module,
+    b_unit: torch.Tensor,
+    layer_names: Sequence[str],
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Like _forward_filtered but also returns detection output with gradients attached."""
+    dev = _model_device(model)
+    dtype = next(model.model.parameters()).dtype
+    b = b_unit.to(dev, dtype).unsqueeze(0)
+    filtered = filt(b)
+    normed = _normalize_batch(filtered, dev, dtype)
+    with _grad_hooks(model, layer_names) as acts:
+        det_out = model.model(_make_nested_tensor(normed))
+    return cast(Dict[str, torch.Tensor], acts), det_out
+
+
+def detection_output_loss(
+    a_det: Dict[str, torch.Tensor],
+    b_det: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Query-aligned KL(logits) + L1(boxes) between A and filtered-B detection outputs.
+
+    No GT labels needed — A's raw outputs are the pseudo-label target.
+    """
+    a_probs = F.softmax(a_det["pred_logits"].detach(), dim=-1)
+    b_log_probs = F.log_softmax(b_det["pred_logits"], dim=-1)
+    logit_loss = F.kl_div(b_log_probs, a_probs, reduction="batchmean")
+    box_loss = F.l1_loss(b_det["pred_boxes"], a_det["pred_boxes"].detach())
+    return logit_loss + box_loss
 
 
 def calibrate(
@@ -524,18 +577,31 @@ def calibrate_epochs(
         p.requires_grad_(True)
 
     n = len(train_pairs)
+    use_det = cfg.loss_mode in ("combined", "detection")
     print(f"  [calibrate_epochs] precomputing A activations for {n} train pairs...")
     a_acts_all: List[Dict[str, torch.Tensor]] = []
+    a_det_all: List[Dict[str, torch.Tensor]] = []
     for i, (a_unit, _) in enumerate(train_pairs):
-        a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+        if use_det:
+            acts, det = _reference_with_detection(model, a_unit, layer_names)
+            a_acts_all.append(acts)
+            a_det_all.append(det)
+        else:
+            a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
         if (i + 1) % 20 == 0 or (i + 1) == n:
             print(f"    A activations: {i+1}/{n}")
 
     test_a_acts_all: List[Dict[str, torch.Tensor]] = []
+    test_a_det_all: List[Dict[str, torch.Tensor]] = []
     if test_pairs:
         print(f"  [calibrate_epochs] precomputing A activations for {len(test_pairs)} test pairs...")
         for a_unit, _ in test_pairs:
-            test_a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+            if use_det:
+                acts, det = _reference_with_detection(model, a_unit, layer_names)
+                test_a_acts_all.append(acts)
+                test_a_det_all.append(det)
+            else:
+                test_a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
 
     opt = torch.optim.Adam(filt.parameters(), lr=cfg.learning_rate)
 
@@ -560,8 +626,18 @@ def calibrate_epochs(
             _, b_unit = train_pairs[pair_idx]
 
             opt.zero_grad(set_to_none=True)
-            b_acts = _forward_filtered(model, filt, b_unit, layer_names)
-            loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation)
+            if use_det:
+                b_acts, b_det = _forward_filtered_full(model, filt, b_unit, layer_names)
+                a_det = a_det_all[pair_idx]
+                if cfg.loss_mode == "detection":
+                    loss = detection_output_loss(a_det, b_det)
+                else:  # combined
+                    feat_loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation)
+                    det_loss = detection_output_loss(a_det, b_det)
+                    loss = feat_loss + cfg.detection_weight * det_loss
+            else:
+                b_acts = _forward_filtered(model, filt, b_unit, layer_names)
+                loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation)
             if cfg.reg_weight > 0:
                 loss = loss + cfg.reg_weight * cast(Any, filt).reg_loss()
             loss.backward()
@@ -579,8 +655,20 @@ def calibrate_epochs(
         if test_pairs and test_a_acts_all:
             vlosses = []
             for ti, (_, tb_unit) in enumerate(test_pairs):
-                vb_acts = _forward_filtered(model, filt, tb_unit, layer_names)
-                vl = group_loss(test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation)
+                if use_det:
+                    vb_acts, vb_det = _forward_filtered_full(model, filt, tb_unit, layer_names)
+                    ta_det = test_a_det_all[ti]
+                    if cfg.loss_mode == "detection":
+                        vl = detection_output_loss(ta_det, vb_det)
+                    else:  # combined
+                        feat_vl = group_loss(
+                            test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation
+                        )
+                        det_vl = detection_output_loss(ta_det, vb_det)
+                        vl = feat_vl + cfg.detection_weight * det_vl
+                else:
+                    vb_acts = _forward_filtered(model, filt, tb_unit, layer_names)
+                    vl = group_loss(test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation)
                 vlosses.append(float(vl.detach()))
             v_loss = sum(vlosses) / len(vlosses)
             val_history.append(v_loss)

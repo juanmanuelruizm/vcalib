@@ -50,6 +50,8 @@ class TrainingConfig:
     early_stopping_patience: int = 5
     seed: int = 42
     checkpoint_every: int = 5
+    loss_mode: str = "activation"  # "activation" | "combined" | "detection"
+    detection_weight: float = 1.0  # β in combined mode
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,7 @@ def _validate_training(raw_training: Any, config_file: Path) -> TrainingConfig:
         return TrainingConfig()
     if not isinstance(raw_training, Mapping):
         raise ValueError(f"Config {config_file!s}: 'training' must be a mapping")
+    _VALID_LOSS_MODES = {"activation", "combined", "detection"}
     try:
         max_epochs = int(raw_training.get("max_epochs", TrainingConfig().max_epochs))
         learning_rate = float(raw_training.get("learning_rate", TrainingConfig().learning_rate))
@@ -137,6 +140,10 @@ def _validate_training(raw_training: Any, config_file: Path) -> TrainingConfig:
         seed = int(raw_training.get("seed", TrainingConfig().seed))
         checkpoint_every = int(
             raw_training.get("checkpoint_every", TrainingConfig().checkpoint_every)
+        )
+        loss_mode = str(raw_training.get("loss_mode", TrainingConfig().loss_mode))
+        detection_weight = float(
+            raw_training.get("detection_weight", TrainingConfig().detection_weight)
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Config {config_file!s}: invalid 'training' value: {exc}") from exc
@@ -150,6 +157,12 @@ def _validate_training(raw_training: Any, config_file: Path) -> TrainingConfig:
         raise ValueError(f"Config {config_file!s}: training.early_stopping_patience must be >= 1")
     if checkpoint_every < 0:
         raise ValueError(f"Config {config_file!s}: training.checkpoint_every must be >= 0")
+    if loss_mode not in _VALID_LOSS_MODES:
+        raise ValueError(
+            f"Config {config_file!s}: training.loss_mode must be one of {sorted(_VALID_LOSS_MODES)}"
+        )
+    if detection_weight <= 0:
+        raise ValueError(f"Config {config_file!s}: training.detection_weight must be > 0")
     return TrainingConfig(
         max_epochs=max_epochs,
         learning_rate=learning_rate,
@@ -157,6 +170,8 @@ def _validate_training(raw_training: Any, config_file: Path) -> TrainingConfig:
         early_stopping_patience=early_stopping_patience,
         seed=seed,
         checkpoint_every=checkpoint_every,
+        loss_mode=loss_mode,
+        detection_weight=detection_weight,
     )
 
 

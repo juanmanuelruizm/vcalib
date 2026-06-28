@@ -138,6 +138,7 @@ CSV_FIELDS = [
     "dataset",
     "group",
     "filter",
+    "loss_mode",
     "train_reduction",
     "test_mean",
     "test_std",
@@ -178,6 +179,8 @@ def run_one(
         reg_weight=cfg.training.reg_weight,
         seed=cfg.training.seed,
         log_every=5,
+        loss_mode=cfg.training.loss_mode,
+        detection_weight=cfg.training.detection_weight,
     )
 
     trained, result = calibrate_epochs(
@@ -202,6 +205,7 @@ def run_one(
         "dataset": cfg.dataset.name,
         "group": cfg.group_name,
         "filter": cfg.filter_display,
+        "loss_mode": cfg.training.loss_mode,
         "train_reduction": f"{tr:.4f}" if tr else "0.0",
         "test_mean": f"{test_eval['mean']:.4f}",
         "test_std": f"{test_eval['std']:.4f}",
@@ -272,6 +276,7 @@ def _worker_run_one(cfg: ExperimentConfig) -> Dict[str, Any]:
             "dataset": cfg.dataset.name,
             "group": cfg.group_name,
             "filter": cfg.filter_display,
+            "loss_mode": cfg.training.loss_mode,
             "train_reduction": "0.0",
             "test_mean": "0.0",
             "test_std": "0.0",

@@ -1,0 +1,19 @@
+name: p2_tone_P24_lv3
+dataset: data/datasets/level_1_vs_level_3
+input_size: 384
+filter:
+  type: tone_curve
+  P: 24
+layer_group:
+  name: phase2_group
+  layers:
+  - backbone.projector
+training:
+  max_epochs: 100
+  learning_rate: 0.005
+  reg_weight: 0.01
+  early_stopping_patience: 10
+  seed: 42
+  checkpoint_every: 10
+output:
+  results_dir: results/experiments

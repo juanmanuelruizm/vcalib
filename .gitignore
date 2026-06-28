@@ -42,6 +42,7 @@ env/
 data/raw
 data/processed/
 data/augmented/
+data/datasets/
 results/
 *.csv
 *.json

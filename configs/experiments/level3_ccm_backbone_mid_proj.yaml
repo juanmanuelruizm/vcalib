@@ -1,0 +1,22 @@
+name: level3_ccm_backbone_mid_proj
+dataset: data/datasets/level_1_vs_level_3
+input_size: 384
+filter:
+  type: ccm_high_order
+layer_group:
+  name: backbone.mid+proj
+  layers:
+  - backbone.layer.4
+  - backbone.layer.5
+  - backbone.layer.6
+  - backbone.layer.7
+  - backbone.projector
+training:
+  max_epochs: 50
+  learning_rate: 0.005
+  reg_weight: 0.01
+  early_stopping_patience: 10
+  seed: 42
+  checkpoint_every: 10
+output:
+  results_dir: results/experiments

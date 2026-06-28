@@ -1,0 +1,22 @@
+name: level2_local_tonemap_backbone_early
+dataset: data/datasets/level_1_vs_level_2
+input_size: 384
+filter:
+  type: local_tonemap
+  grid_size: 4
+layer_group:
+  name: backbone.early
+  layers:
+  - backbone.layer.0
+  - backbone.layer.1
+  - backbone.layer.2
+  - backbone.layer.3
+training:
+  max_epochs: 50
+  learning_rate: 0.005
+  reg_weight: 0.01
+  early_stopping_patience: 10
+  seed: 42
+  checkpoint_every: 10
+output:
+  results_dir: results/experiments

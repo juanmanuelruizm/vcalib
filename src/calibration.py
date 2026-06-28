@@ -319,10 +319,150 @@ def val_reduction(result: CalibrationResult) -> Optional[float]:
 
 
 def overfit_gate_ok(result: CalibrationResult, min_ratio: float = 0.5) -> bool:
-    """True if val reduction ≥ min_ratio * train reduction (the held-out generalization gate)."""
+    """True if val reduction >= min_ratio * train reduction (the held-out generalization gate)."""
     tr, vr = train_reduction(result), val_reduction(result)
     if tr is None or vr is None:
-        return True  # no val → don't gate (caller decides)
+        return True  # no val -> don't gate (caller decides)
     if tr <= 0:
         return vr > 0
     return vr / max(tr, 1e-9) >= min_ratio
+
+
+def calibrate_multi(
+    filt: torch.nn.Module,
+    train_pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+    layer_names: Sequence[str],
+    model: Any,
+    cfg: Optional[CalibrationConfig] = None,
+    test_pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+) -> Tuple[torch.nn.Module, CalibrationResult]:
+    """Train ``filt`` on MULTIPLE A/B pairs (cycling through them each step).
+
+    Each step picks the next pair in round-robin order, applies the filter to that B,
+    forwards through the model, and minimizes the group loss vs that pair's cached A
+    activations. This prevents the filter from memorizing a single scene and forces it
+    to learn the illumination shift itself -- which generalizes.
+
+    Args:
+        filt: Filter to train.
+        train_pairs: List of (A, B) tuples, each (3, H, W) [0, 1] tensors.
+        layer_names: Layer group for the loss.
+        model: Pre-loaded LibreRFDETR wrapper.
+        cfg: Hyperparameters.
+        test_pairs: Optional held-out pairs for val-based early stopping.
+
+    Returns:
+        (trained filter, CalibrationResult). Same shape as :func:`calibrate`.
+    """
+    import random
+
+    cfg = cfg or CalibrationConfig()
+    torch.manual_seed(cfg.seed)
+    rng = random.Random(cfg.seed)
+    dev = _model_device(model)
+
+    filt = filt.to(dev)
+    filt.train()
+    for p in filt.parameters():
+        p.requires_grad_(True)
+
+    # Precompute A activations for ALL train pairs (one forward each, model is frozen)
+    print(f"  [calibrate_multi] precomputing A activations for {len(train_pairs)} train pairs...")
+    a_acts_all: List[Dict[str, torch.Tensor]] = []
+    for i, (a_unit, _) in enumerate(train_pairs):
+        a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+        if (i + 1) % 20 == 0 or (i + 1) == len(train_pairs):
+            print(f"    A activations: {i+1}/{len(train_pairs)}")
+
+    # Precompute test A activations if test pairs given
+    test_a_acts_all: List[Dict[str, torch.Tensor]] = []
+    if test_pairs:
+        print(f"  [calibrate_multi] precomputing A activations for {len(test_pairs)} test pairs...")
+        for a_unit, _ in test_pairs:
+            test_a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+
+    opt = torch.optim.Adam(filt.parameters(), lr=cfg.learning_rate)
+
+    best_val = float("inf")
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+    patience_left = cfg.early_stopping_patience
+    train_history: List[float] = []
+    val_history: List[float] = []
+    t0 = time.time()
+    last_loss = float("inf")
+    converged = False
+    baseline_train: Optional[float] = None
+    baseline_val: Optional[float] = None
+    n = len(train_pairs)
+    order = list(range(n))
+    rng.shuffle(order)
+
+    for step in range(1, cfg.max_steps + 1):
+        # Round-robin through pairs (shuffled order, reshuffled each epoch)
+        pair_idx = order[(step - 1) % n]
+        a_acts = a_acts_all[pair_idx]
+        _, b_unit = train_pairs[pair_idx]
+
+        opt.zero_grad(set_to_none=True)
+        b_acts = _forward_filtered(model, filt, b_unit, layer_names)
+        loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation)
+        if cfg.reg_weight > 0:
+            loss = loss + cfg.reg_weight * cast(Any, filt).reg_loss()
+        loss.backward()
+        opt.step()
+        last_loss = float(loss.detach())
+        train_history.append(last_loss)
+        if baseline_train is None:
+            baseline_train = last_loss
+
+        # Validation: average loss over ALL test pairs (not just one)
+        v_loss: Optional[float] = None
+        if test_pairs and test_a_acts_all:
+            vlosses = []
+            for ti, (_, tb_unit) in enumerate(test_pairs):
+                vb_acts = _forward_filtered(model, filt, tb_unit, layer_names)
+                vl = group_loss(test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation)
+                vlosses.append(float(vl.detach()))
+            v_loss = sum(vlosses) / len(vlosses)
+            val_history.append(v_loss)
+            if baseline_val is None:
+                baseline_val = v_loss
+
+        # Early stopping
+        monitor = v_loss if v_loss is not None else last_loss
+        if monitor < best_val - 1e-7:
+            best_val = monitor
+            best_state = {k: v.detach().clone() for k, v in filt.state_dict().items()}
+            patience_left = cfg.early_stopping_patience
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                converged = True
+                break
+
+        # Reshuffle order each epoch
+        if (step - 1) % n == n - 1:
+            rng.shuffle(order)
+
+        if cfg.log_every and step % cfg.log_every == 0:
+            tag = f"val={v_loss:.5f} " if v_loss is not None else ""
+            print(f"  [calibrate_multi] step {step:3d} pair={pair_idx} train={last_loss:.5f} {tag}patience={patience_left}")
+
+    wall = time.time() - t0
+    if best_state is not None:
+        filt.load_state_dict(best_state)
+    filt.eval()
+
+    result = CalibrationResult(
+        filter_state={k: v.detach().cpu().clone() for k, v in filt.state_dict().items()},
+        steps=step,
+        wall_clock_s=wall,
+        final_train_loss=last_loss,
+        final_val_loss=val_history[-1] if val_history else None,
+        train_history=train_history,
+        val_history=val_history,
+        converged=converged,
+    )
+    result.__dict__["baseline_train"] = baseline_train
+    result.__dict__["baseline_val"] = baseline_val
+    return filt, result

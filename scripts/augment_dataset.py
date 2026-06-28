@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """Apply geometry-only augmentation to the captured A/B dataset.
 
-Reads the raw dataset (discover_pairs layout), splits 80/20 by scene, then:
-  - train: writes original pair + N augmented copies per (scene, level) pair
-  - test:  writes original pairs unchanged
+Stage 2 of data pipeline. Reads raw dataset (scenes_YYYYMMDD/scene_XXX/level_Y.jpg),
+splits 80/20 by scene, applies identical geometric transforms to A/B image pairs.
 
-Augmentations are geometry-only (rotation, zoom, horizontal flip) and are applied
-IDENTICALLY to both A (reference) and B (shifted) images in each pair so the
-illumination relationship is fully preserved.
+PIPELINE:
+  Raw images (data/raw/scenes_YYYYMMDD/)
+    → discover_pairs() discovers A/B relationships
+    → 80/20 scene split (train: 24 scenes, test: 6 scenes)
+    → Train: 1 original + N augmented copies per pair
+    → Test: 1 original (unchanged)
 
-The minimum zoom (1.2×) guarantees that black corners from ±5° rotation are
-eliminated for aspect ratios up to 2:1 (common camera formats).
+AUGMENTATIONS (applied identically to both A and B):
+  - Rotation: ±5° (black corners eliminated by zoom)
+  - Zoom: 1.2× to 1.35× (covers rotation artifacts)
+  - Horizontal flip: 50% probability
+  - Crop offset: ±12% for composition variation
 
-Output layout (compatible with discover_pairs):
-    {out}/train/{scene}_{level}_aug{k}/level_1.jpg      <- A (reference, augmented)
-    {out}/train/{scene}_{level}_aug{k}/level_{level}.jpg <- B (shifted, same transform)
-    {out}/test/{scene}_{level}/level_1.jpg
-    {out}/test/{scene}_{level}/level_{level}.jpg
+OUTPUT:
+  data/augmented/train/scene_001_2_aug0/level_1.jpg  ← A original
+  data/augmented/train/scene_001_2_aug0/level_2.jpg  ← B original
+  data/augmented/train/scene_001_2_aug1/level_1.jpg  ← A augmented
+  data/augmented/train/scene_001_2_aug1/level_2.jpg  ← B augmented (same transforms)
+  ...
+  data/augmented/test/scene_007_2/level_1.jpg        ← A from held-out scene
+  data/augmented/test/scene_007_2/level_2.jpg        ← B from held-out scene
+
+KEY: A and B always receive identical transforms → illumination relationship preserved
 
 Usage:
     uv run python scripts/augment_dataset.py \\

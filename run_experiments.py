@@ -1,5 +1,11 @@
 """Train filters on the real A/B datasets using ALL train pairs.
 
+.. deprecated::
+    Superseded by ``run_configs.py`` + ``configs/experiments/*.yaml`` (config-driven
+    experiment runner). This file is retained for backwards compatibility; new
+    experiments should be defined as YAML configs and run via ``run_configs.py``.
+    See ``docs/specs/2026-06-28-config-driven-experiments.md``.
+
 Two independent experiments:
   - level_1_vs_level_2 (milder shift)
   - level_1_vs_level_3 (bigger shift)

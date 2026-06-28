@@ -1,32 +1,39 @@
-"""Affine per-channel filter: I' = diag([a_R, a_G, a_B]) @ I + [b_R, b_G, b_B]."""
+"""Affine per-channel filter (6 params): I'_c = a_c * I_c + b_c.
+
+The flagship linear photometric correction. Covers sensor gain, white balance,
+exposure, and per-channel black-level offset. Identity init = no-op.
+"""
+
+from __future__ import annotations
+
+from typing import Dict
 
 import torch
 import torch.nn as nn
 
+from .base import Filter, clamp_param
 
-class Affine6Param(nn.Module):
-    """
-    Learnable affine transformation per RGB channel.
+GAIN_RANGE = (0.1, 2.0)
+OFFSET_RANGE = (-1.0, 1.0)
 
-    Maps each channel independently: I'_c = a_c * I_c + b_c
-    Covers: sensor gain, white balance, exposure offset.
-    6 parameters total (3 gains + 3 offsets).
-    """
 
-    def __init__(self, init_identity: bool = True):
+class Affine6Param(Filter):
+    """Learnable per-channel affine: ``I'_c = a_c * I_c + b_c`` (6 params)."""
+
+    def __init__(self, init_identity: bool = True) -> None:
         super().__init__()
-        # TODO: Implement initialization
-        # - gains: 3 params, range [0.1, 2.0]
-        # - offsets: 3 params, range [-1.0, 1.0]
+        g_init = 1.0 if init_identity else 0.5 * (GAIN_RANGE[0] + GAIN_RANGE[1])
+        b_init = 0.0 if init_identity else 0.5 * (OFFSET_RANGE[0] + OFFSET_RANGE[1])
+        self.gains = nn.Parameter(torch.full((3,), float(g_init)))
+        self.offsets = nn.Parameter(torch.full((3,), float(b_init)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply affine transformation to input image."""
-        # TODO: Implement forward pass
-        # x: (B, 3, H, W) or (B, H, W, 3) in [0, 1]
-        # return: transformed image, clamped to [0, 1]
-        pass
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        g = clamp_param(self.gains, *GAIN_RANGE).view(1, 3, 1, 1)
+        b = clamp_param(self.offsets, *OFFSET_RANGE).view(1, 3, 1, 1)
+        return g * x + b
 
-    def get_params(self) -> dict:
-        """Return current parameters."""
-        # TODO: Return gains and offsets as dict
-        pass
+    def get_params(self) -> Dict[str, torch.Tensor]:
+        return {
+            "gains": clamp_param(self.gains, *GAIN_RANGE).detach(),
+            "offsets": clamp_param(self.offsets, *OFFSET_RANGE).detach(),
+        }

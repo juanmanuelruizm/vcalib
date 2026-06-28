@@ -39,8 +39,9 @@ env/
 .claude/settings.local.json
 
 # Data & results (generated)
-data/raw/
+data/raw
 data/processed/
+data/augmented/
 results/
 *.csv
 *.json

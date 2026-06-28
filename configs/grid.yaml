@@ -40,12 +40,45 @@ layer_group_search:
   singletons: false
 
 # --- Grid axes crossed with each resolved layer group ---
+# Filter library (see src/filters/__init__.py::FILTER_REGISTRY). The grid sweeps
+# layer_group x filter x loss. Comment out filters to trim the sweep cost
+# (35 groups x N filters x 1 loss). Composites chain corrections a single filter
+# cannot express (linear + non-linear + color), e.g. affine -> gamma -> saturation.
 grid:
   filters:
+    # Simple / low-param (cheap baselines)
+    - type: "brightness_2param"
+    - type: "white_balance_3param"
+    - type: "saturation_1param"
+    - type: "contrast_1param"
+    - type: "gamma_3param"
+    # Flagship linear (spec baselines)
     - type: "affine_6param"
-      params: 6
     - type: "matrix_12param"
-      params: 12
+    # Spatially-varying (zone-dependent illumination; bilinear K×K control grid).
+    - type: "spatial_brightness"      # K=2 -> 8 params
+    - type: "spatial_whitebalance"    # K=2 -> 12 params
+    - type: "spatial_gamma"           # K=2 -> 12 params
+    - type: "spatial_affine"          # K=2 -> 24 params
+    # Advanced / high-capacity (expressiveness-first; gated by held-out val + reg_loss)
+    - type: "chromatic_adaptation"           # F4: Bradford LMS (3 params, low risk)
+    - type: "ccm_high_order"                 # F3: degree-2 polynomial CCM (30 params)
+    - type: "tone_curve"                     # F2: P=16 monotone curves (45 params)
+    - type: "lut_3d"                         # F1: N=9 3D LUT (2187 params) — headline
+      size: 9
+    # - type: "lut_3d"                       # F1: N=17 (14739 params) — heavier
+    #   size: 17
+    - type: "spatial_tone_curve"             # F5: P=8, K=3 (189 params)
+      P: 8
+      grid_size: 3
+    - type: "local_tonemap"                  # F6: K=4 CLAHE-like (16 params)
+      grid_size: 4
+    # - type: "lut_3d_lowrank"               # F7: M=16 low-rank LUT (16 params)
+    #   M: 16
+    # Composites (structured cheaper alternatives to the full LUT)
+    # - composite: ["ccm_high_order", "tone_curve"]
+    # - composite: ["chromatic_adaptation", "lut_3d"]   # pass size via per-spec kwargs
+    # - composite: ["spatial_affine", "local_tonemap"]
 
   loss_functions:
     - "l2"                                   # L2 (primary)
@@ -66,10 +99,14 @@ training:
   max_steps: 100
   early_stopping_patience: 10
   batch_size: 1                              # Constrained by GPU memory with activations
+  reg_weight: 0.01                           # weight on filter.reg_loss() in the group loss
 
 validation:
   split: 0.2                                 # 20% of scenes held out for validation
   random_seed: 42
+  overfit_gate:
+    enabled: true
+    min_val_recovery_ratio: 0.5              # val reduction must be ≥50% of train reduction
 
 logging:
   log_every_n_steps: 5

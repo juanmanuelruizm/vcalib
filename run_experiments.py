@@ -6,12 +6,16 @@ Two independent experiments:
 
 For each experiment x filter x layer_group:
   1. Load ALL 144 train pairs as (A, B) tensors
-  2. Calibrate with calibrate_multi (cycles through all 144 pairs each epoch)
+  2. Calibrate with calibrate_epochs (epoch-based loop over all 144 pairs)
   3. Evaluate on the 6 test pairs (mean + std reduction)
-  4. Report every filter x group combination separately
+  4. Log metrics + checkpoints to MLflow (mlruns/ by default)
 
 Usage:
   uv run python run_experiments.py
+
+MLflow UI:
+  mlflow ui --backend-store-uri results/mlruns
+  # then open http://localhost:5000
 """
 
 from __future__ import annotations
@@ -19,13 +23,15 @@ from __future__ import annotations
 import csv
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import mlflow
 import torch
 
 from src.calibration import (
     CalibrationConfig,
     calibrate_epochs,
+    train_reduction,
     _forward_filtered,
     compute_reference_activations,
     group_loss,
@@ -35,9 +41,15 @@ from src.utils.activations import load_model, to_unit_rgb
 
 DATASETS_ROOT = Path("data/datasets")
 RESULTS_DIR = Path("results/experiments")
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINTS_DIR = RESULTS_DIR / "checkpoints"
+MLFLOW_TRACKING_URI = str(RESULTS_DIR / "mlruns")
 
-# 10 filters across the capacity spectrum
+MAX_EPOCHS = 20
+LR = 5e-3
+REG_WEIGHT = 0.01
+INPUT_SIZE = 384
+CHECKPOINT_EVERY = 5  # save checkpoint every N epochs
+
 FILTERS = [
     {"type": "brightness_2param"},
     {"type": "affine_6param"},
@@ -51,17 +63,11 @@ FILTERS = [
     {"type": "local_tonemap", "grid_size": 4},
 ]
 
-# 3 layer groups
 LAYER_GROUPS = {
     "backbone.early": ["backbone.layer.0", "backbone.layer.1", "backbone.layer.2", "backbone.layer.3"],
     "backbone.all": [f"backbone.layer.{i}" for i in range(12)],
     "projector": ["backbone.projector"],
 }
-
-MAX_EPOCHS = 20
-LR = 5e-3
-REG_WEIGHT = 0.01
-INPUT_SIZE = 384
 
 
 def filter_name(spec: Dict) -> str:
@@ -92,7 +98,6 @@ def discover_pairs(exp_dir: Path) -> Tuple[List[Tuple[Path, Path]], List[Tuple[P
 
 
 def load_all_pairs(paths: List[Tuple[Path, Path]]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """Load all pairs as (A, B) tensors."""
     pairs = []
     for a_path, b_path in paths:
         a = to_unit_rgb(a_path, INPUT_SIZE)
@@ -114,13 +119,11 @@ def evaluate_on_test(
     for a_unit, b_unit in test_pairs:
         a_acts = compute_reference_activations(model, a_unit, layer_names)
 
-        # Baseline: unfiltered B vs A
         identity = get_filter("brightness_2param")
         identity.to(next(model.model.parameters()).device)
         b_acts_base = _forward_filtered(model, identity, b_unit, layer_names)
         base_loss = float(group_loss(a_acts, b_acts_base, layer_names))
 
-        # Filtered B vs A
         b_acts_filt = _forward_filtered(model, filt, b_unit, layer_names)
         filt_loss = float(group_loss(a_acts, b_acts_filt, layer_names))
 
@@ -136,6 +139,26 @@ def evaluate_on_test(
     }
 
 
+def _make_epoch_callback(
+    ckpt_dir: Path,
+    checkpoint_every: int,
+) -> Callable[[int, float, Optional[float], torch.nn.Module], None]:
+    """Build an on_epoch_end callback that logs metrics to MLflow and saves checkpoints."""
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    def on_epoch_end(epoch: int, train_loss: float, val_loss: Optional[float], filt: torch.nn.Module) -> None:
+        mlflow.log_metric("train_loss", train_loss, step=epoch)
+        if val_loss is not None:
+            mlflow.log_metric("val_loss", val_loss, step=epoch)
+
+        if epoch % checkpoint_every == 0:
+            ckpt_path = ckpt_dir / f"epoch_{epoch:04d}.pt"
+            torch.save({k: v.cpu() for k, v in filt.state_dict().items()}, ckpt_path)
+            mlflow.log_artifact(str(ckpt_path), artifact_path="checkpoints")
+
+    return on_epoch_end
+
+
 def run_experiment(exp_name: str, exp_dir: Path, model: Any) -> List[Dict]:
     train_paths, test_paths = discover_pairs(exp_dir)
     print(f"\n{'='*70}")
@@ -147,11 +170,13 @@ def run_experiment(exp_name: str, exp_dir: Path, model: Any) -> List[Dict]:
         print("  [SKIP] No pairs found")
         return []
 
-    # Load ALL pairs as tensors
     print(f"  Loading {len(train_paths)} train pairs...")
     train_pairs = load_all_pairs(train_paths)
     print(f"  Loading {len(test_paths)} test pairs...")
     test_pairs = load_all_pairs(test_paths)
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(exp_name)
 
     results = []
     total = len(FILTERS) * len(LAYER_GROUPS)
@@ -161,60 +186,90 @@ def run_experiment(exp_name: str, exp_dir: Path, model: Any) -> List[Dict]:
         for spec in FILTERS:
             idx += 1
             fname = filter_name(spec)
+            run_name = f"{group_name}__{fname}"
             print(f"\n  [{idx}/{total}] group={group_name} filter={fname}")
 
-            filt = build_filter(spec)
-            cfg = CalibrationConfig(
-                max_epochs=MAX_EPOCHS,
-                early_stopping_patience=5,
-                learning_rate=LR,
-                reg_weight=REG_WEIGHT,
-                log_every=5,
-                seed=42,
-            )
+            ckpt_dir = CHECKPOINTS_DIR / exp_name / run_name
 
-            t0 = time.time()
-            try:
-                trained, result = calibrate_epochs(
-                    filt, train_pairs, layer_names,
-                    model=model, cfg=cfg,
-                    test_pairs=test_pairs,
+            with mlflow.start_run(run_name=run_name):
+                mlflow.log_params({
+                    "experiment": exp_name,
+                    "group": group_name,
+                    "filter": fname,
+                    "max_epochs": MAX_EPOCHS,
+                    "lr": LR,
+                    "reg_weight": REG_WEIGHT,
+                    "checkpoint_every": CHECKPOINT_EVERY,
+                    "n_train_pairs": len(train_pairs),
+                    "n_test_pairs": len(test_pairs),
+                })
+
+                filt = build_filter(spec)
+                cfg = CalibrationConfig(
+                    max_epochs=MAX_EPOCHS,
+                    early_stopping_patience=5,
+                    learning_rate=LR,
+                    reg_weight=REG_WEIGHT,
+                    log_every=5,
+                    seed=42,
                 )
-            except Exception as exc:
-                print(f"    [FAIL] calibrate_multi failed: {exc}")
-                continue
 
-            wall = time.time() - t0
+                try:
+                    trained, result = calibrate_epochs(
+                        filt, train_pairs, layer_names,
+                        model=model, cfg=cfg,
+                        test_pairs=test_pairs,
+                        on_epoch_end=_make_epoch_callback(ckpt_dir, CHECKPOINT_EVERY),
+                    )
+                except Exception as exc:
+                    print(f"    [FAIL] {exc}")
+                    mlflow.set_tag("status", "failed")
+                    mlflow.log_param("error", str(exc))
+                    continue
 
-            # Evaluate on test pairs
-            test_eval = evaluate_on_test(trained, model, test_pairs, layer_names)
+                # Save best model checkpoint
+                best_path = ckpt_dir / "best.pt"
+                torch.save({k: v.cpu() for k, v in result.filter_state.items()}, best_path)
+                mlflow.log_artifact(str(best_path), artifact_path="checkpoints")
 
-            # Train reduction (from the calibration result)
-            from src.calibration import train_reduction
-            train_red = train_reduction(result)
+                # Final evaluation on test pairs
+                test_eval = evaluate_on_test(trained, model, test_pairs, layer_names)
+                train_red = train_reduction(result)
 
-            row = {
-                "experiment": exp_name,
-                "group": group_name,
-                "filter": fname,
-                "train_reduction": f"{train_red:.4f}" if train_red else "0.0",
-                "test_mean": f"{test_eval['mean']:.4f}",
-                "test_std": f"{test_eval['std']:.4f}",
-                "test_n": test_eval["n"],
-                "steps": result.steps,
-                "wall_s": f"{wall:.1f}",
-                "per_pair_reductions": ";".join(f"{p['reduction']:.4f}" for p in test_eval["per_pair"]),
-            }
-            results.append(row)
+                mlflow.log_metrics({
+                    "test_mean_reduction": test_eval["mean"],
+                    "test_std_reduction": test_eval["std"],
+                    "train_reduction": float(train_red or 0),
+                    "total_steps": result.steps,
+                    "wall_s": result.wall_clock_s,
+                    "converged": int(result.converged),
+                })
+                mlflow.set_tag("status", "ok")
 
-            ratio = test_eval["mean"] / train_red if (train_red and train_red > 0) else 0
-            print(f"    -> train_red={train_red:.3f} test_mean={test_eval['mean']:.3f}+/-{test_eval['std']:.3f} ratio={ratio:.2f} steps={result.steps} {wall:.1f}s")
+                row = {
+                    "experiment": exp_name,
+                    "group": group_name,
+                    "filter": fname,
+                    "train_reduction": f"{train_red:.4f}" if train_red else "0.0",
+                    "test_mean": f"{test_eval['mean']:.4f}",
+                    "test_std": f"{test_eval['std']:.4f}",
+                    "test_n": test_eval["n"],
+                    "steps": result.steps,
+                    "wall_s": f"{result.wall_clock_s:.1f}",
+                    "per_pair_reductions": ";".join(f"{p['reduction']:.4f}" for p in test_eval["per_pair"]),
+                }
+                results.append(row)
+
+                ratio = test_eval["mean"] / train_red if (train_red and train_red > 0) else 0
+                print(
+                    f"    -> train_red={train_red:.3f} test_mean={test_eval['mean']:.3f}"
+                    f"+/-{test_eval['std']:.3f} ratio={ratio:.2f} steps={result.steps} {result.wall_clock_s:.1f}s"
+                )
 
     return results
 
 
-def print_full_table(results: List[Dict], exp_name: str):
-    """Print every filter x group combo for one experiment."""
+def print_full_table(results: List[Dict], exp_name: str) -> None:
     exp = [r for r in results if r["experiment"] == exp_name]
     if not exp:
         return
@@ -232,7 +287,9 @@ def print_full_table(results: List[Dict], exp_name: str):
         print(f"{r['group']:<18} {r['filter']:<40} {tr:>7.3f} {tm:>10.3f} {ts:>9.3f} {ratio:>7.2f} {r['steps']:>6}")
 
 
-def main():
+def main() -> None:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
     print("Loading RF-DETR nano model...")
     model = load_model(size="n")
     print("Model loaded.\n")
@@ -250,18 +307,19 @@ def main():
         results = run_experiment(exp_name, exp_dir, model)
         all_results.extend(results)
 
-    # Write CSV
     csv_path = RESULTS_DIR / "experiment_results_multi.csv"
-    fieldnames = ["experiment", "group", "filter", "train_reduction",
-                  "test_mean", "test_std", "test_n", "steps", "wall_s", "per_pair_reductions"]
+    fieldnames = [
+        "experiment", "group", "filter", "train_reduction",
+        "test_mean", "test_std", "test_n", "steps", "wall_s", "per_pair_reductions",
+    ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in all_results:
             writer.writerow(r)
     print(f"\nResults saved to {csv_path}")
+    print(f"MLflow UI: mlflow ui --backend-store-uri {MLFLOW_TRACKING_URI}")
 
-    # Print full tables
     for exp_name, _ in experiments:
         print_full_table(all_results, exp_name)
 

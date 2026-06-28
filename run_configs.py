@@ -46,13 +46,14 @@ def discover_pairs(exp_dir: Path) -> Tuple[List[Tuple[Path, Path]], List[Tuple[P
     Auto-detects the B level from the directory name (``level_1_vs_level_N`` ->
     ``level_N``). Each pair directory must contain ``level_1.jpg`` and ``level_N.jpg``.
     """
-    b_level: Optional[str] = None
-    for part in exp_dir.name.split("_"):
-        if part.startswith("level_") and part != "level_1":
-            b_level = part
-            break
-    if b_level is None:
-        b_level = "level_2"
+    # Parse the B level from the directory name (``level_1_vs_level_N``).
+    # Splitting on ``_`` cannot work (it would split ``level_3`` into ``level`` and
+    # ``3``), so use a regex across the full name and pick the highest level != 1.
+    import re
+
+    levels = [int(n) for n in re.findall(r"level_(\d+)", exp_dir.name)]
+    b_candidates = sorted((l for l in levels if l != 1), reverse=True)
+    b_level = f"level_{b_candidates[0]}" if b_candidates else "level_2"
 
     def _scan(sub: str) -> List[Tuple[Path, Path]]:
         d = exp_dir / sub

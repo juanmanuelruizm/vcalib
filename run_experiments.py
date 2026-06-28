@@ -5,27 +5,29 @@ Two independent experiments:
   - level_1_vs_level_3 (bigger shift)
 
 For each experiment x filter x layer_group:
-  1. Load ALL 144 train pairs as (A, B) tensors
-  2. Calibrate with calibrate_epochs (epoch-based loop over all 144 pairs)
-  3. Evaluate on the 6 test pairs (mean + std reduction)
-  4. Log metrics + checkpoints to MLflow (mlruns/ by default)
+  1. Load ALL train pairs as (A, B) tensors
+  2. Calibrate with calibrate_epochs (epoch-based loop)
+  3. Evaluate on test pairs (mean + std reduction)
+
+Outputs (all under results/experiments/):
+  experiment_results_multi.csv         — final summary, one row per run
+  runs/<exp>/<group>__<filter>/
+    metrics.jsonl                      — one JSON line per epoch: epoch, train_loss, val_loss
+    best.pt                            — filter state_dict at best val epoch
+    epoch_NNNN.pt                      — periodic checkpoints every CHECKPOINT_EVERY epochs
 
 Usage:
   uv run python run_experiments.py
-
-MLflow UI:
-  mlflow ui --backend-store-uri results/mlruns
-  # then open http://localhost:5000
 """
 
 from __future__ import annotations
 
 import csv
+import json
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import mlflow
 import torch
 
 from src.calibration import (
@@ -41,8 +43,7 @@ from src.utils.activations import load_model, to_unit_rgb
 
 DATASETS_ROOT = Path("data/datasets")
 RESULTS_DIR = Path("results/experiments")
-CHECKPOINTS_DIR = RESULTS_DIR / "checkpoints"
-MLFLOW_TRACKING_URI = str(RESULTS_DIR / "mlruns")
+RUNS_DIR = RESULTS_DIR / "runs"
 
 MAX_EPOCHS = 20
 LR = 5e-3
@@ -112,7 +113,6 @@ def evaluate_on_test(
     test_pairs: List[Tuple[torch.Tensor, torch.Tensor]],
     layer_names: List[str],
 ) -> Dict[str, Any]:
-    """Evaluate trained filter on all test pairs. Returns per-pair + aggregate."""
     import numpy as np
 
     per_pair = []
@@ -140,21 +140,23 @@ def evaluate_on_test(
 
 
 def _make_epoch_callback(
-    ckpt_dir: Path,
+    run_dir: Path,
     checkpoint_every: int,
 ) -> Callable[[int, float, Optional[float], torch.nn.Module], None]:
-    """Build an on_epoch_end callback that logs metrics to MLflow and saves checkpoints."""
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    """Build an on_epoch_end callback that writes metrics.jsonl and periodic checkpoints."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = run_dir / "metrics.jsonl"
 
     def on_epoch_end(epoch: int, train_loss: float, val_loss: Optional[float], filt: torch.nn.Module) -> None:
-        mlflow.log_metric("train_loss", train_loss, step=epoch)
+        record: Dict[str, Any] = {"epoch": epoch, "train_loss": train_loss}
         if val_loss is not None:
-            mlflow.log_metric("val_loss", val_loss, step=epoch)
+            record["val_loss"] = val_loss
+        with open(metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
 
         if epoch % checkpoint_every == 0:
-            ckpt_path = ckpt_dir / f"epoch_{epoch:04d}.pt"
+            ckpt_path = run_dir / f"epoch_{epoch:04d}.pt"
             torch.save({k: v.cpu() for k, v in filt.state_dict().items()}, ckpt_path)
-            mlflow.log_artifact(str(ckpt_path), artifact_path="checkpoints")
 
     return on_epoch_end
 
@@ -175,9 +177,6 @@ def run_experiment(exp_name: str, exp_dir: Path, model: Any) -> List[Dict]:
     print(f"  Loading {len(test_paths)} test pairs...")
     test_pairs = load_all_pairs(test_paths)
 
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(exp_name)
-
     results = []
     total = len(FILTERS) * len(LAYER_GROUPS)
     idx = 0
@@ -187,84 +186,57 @@ def run_experiment(exp_name: str, exp_dir: Path, model: Any) -> List[Dict]:
             idx += 1
             fname = filter_name(spec)
             run_name = f"{group_name}__{fname}"
+            run_dir = RUNS_DIR / exp_name / run_name
             print(f"\n  [{idx}/{total}] group={group_name} filter={fname}")
 
-            ckpt_dir = CHECKPOINTS_DIR / exp_name / run_name
+            filt = build_filter(spec)
+            cfg = CalibrationConfig(
+                max_epochs=MAX_EPOCHS,
+                early_stopping_patience=5,
+                learning_rate=LR,
+                reg_weight=REG_WEIGHT,
+                log_every=5,
+                seed=42,
+            )
 
-            with mlflow.start_run(run_name=run_name):
-                mlflow.log_params({
-                    "experiment": exp_name,
-                    "group": group_name,
-                    "filter": fname,
-                    "max_epochs": MAX_EPOCHS,
-                    "lr": LR,
-                    "reg_weight": REG_WEIGHT,
-                    "checkpoint_every": CHECKPOINT_EVERY,
-                    "n_train_pairs": len(train_pairs),
-                    "n_test_pairs": len(test_pairs),
-                })
-
-                filt = build_filter(spec)
-                cfg = CalibrationConfig(
-                    max_epochs=MAX_EPOCHS,
-                    early_stopping_patience=5,
-                    learning_rate=LR,
-                    reg_weight=REG_WEIGHT,
-                    log_every=5,
-                    seed=42,
+            try:
+                trained, result = calibrate_epochs(
+                    filt, train_pairs, layer_names,
+                    model=model, cfg=cfg,
+                    test_pairs=test_pairs,
+                    on_epoch_end=_make_epoch_callback(run_dir, CHECKPOINT_EVERY),
                 )
+            except Exception as exc:
+                print(f"    [FAIL] {exc}")
+                continue
 
-                try:
-                    trained, result = calibrate_epochs(
-                        filt, train_pairs, layer_names,
-                        model=model, cfg=cfg,
-                        test_pairs=test_pairs,
-                        on_epoch_end=_make_epoch_callback(ckpt_dir, CHECKPOINT_EVERY),
-                    )
-                except Exception as exc:
-                    print(f"    [FAIL] {exc}")
-                    mlflow.set_tag("status", "failed")
-                    mlflow.log_param("error", str(exc))
-                    continue
+            # Save best model
+            best_path = run_dir / "best.pt"
+            torch.save({k: v.cpu() for k, v in result.filter_state.items()}, best_path)
 
-                # Save best model checkpoint
-                best_path = ckpt_dir / "best.pt"
-                torch.save({k: v.cpu() for k, v in result.filter_state.items()}, best_path)
-                mlflow.log_artifact(str(best_path), artifact_path="checkpoints")
+            test_eval = evaluate_on_test(trained, model, test_pairs, layer_names)
+            train_red = train_reduction(result)
 
-                # Final evaluation on test pairs
-                test_eval = evaluate_on_test(trained, model, test_pairs, layer_names)
-                train_red = train_reduction(result)
+            row = {
+                "experiment": exp_name,
+                "group": group_name,
+                "filter": fname,
+                "train_reduction": f"{train_red:.4f}" if train_red else "0.0",
+                "test_mean": f"{test_eval['mean']:.4f}",
+                "test_std": f"{test_eval['std']:.4f}",
+                "test_n": test_eval["n"],
+                "steps": result.steps,
+                "wall_s": f"{result.wall_clock_s:.1f}",
+                "converged": result.converged,
+                "per_pair_reductions": ";".join(f"{p['reduction']:.4f}" for p in test_eval["per_pair"]),
+            }
+            results.append(row)
 
-                mlflow.log_metrics({
-                    "test_mean_reduction": test_eval["mean"],
-                    "test_std_reduction": test_eval["std"],
-                    "train_reduction": float(train_red or 0),
-                    "total_steps": result.steps,
-                    "wall_s": result.wall_clock_s,
-                    "converged": int(result.converged),
-                })
-                mlflow.set_tag("status", "ok")
-
-                row = {
-                    "experiment": exp_name,
-                    "group": group_name,
-                    "filter": fname,
-                    "train_reduction": f"{train_red:.4f}" if train_red else "0.0",
-                    "test_mean": f"{test_eval['mean']:.4f}",
-                    "test_std": f"{test_eval['std']:.4f}",
-                    "test_n": test_eval["n"],
-                    "steps": result.steps,
-                    "wall_s": f"{result.wall_clock_s:.1f}",
-                    "per_pair_reductions": ";".join(f"{p['reduction']:.4f}" for p in test_eval["per_pair"]),
-                }
-                results.append(row)
-
-                ratio = test_eval["mean"] / train_red if (train_red and train_red > 0) else 0
-                print(
-                    f"    -> train_red={train_red:.3f} test_mean={test_eval['mean']:.3f}"
-                    f"+/-{test_eval['std']:.3f} ratio={ratio:.2f} steps={result.steps} {result.wall_clock_s:.1f}s"
-                )
+            ratio = test_eval["mean"] / train_red if (train_red and train_red > 0) else 0
+            print(
+                f"    -> train_red={train_red:.3f} test_mean={test_eval['mean']:.3f}"
+                f"+/-{test_eval['std']:.3f} ratio={ratio:.2f} steps={result.steps} {result.wall_clock_s:.1f}s"
+            )
 
     return results
 
@@ -310,7 +282,7 @@ def main() -> None:
     csv_path = RESULTS_DIR / "experiment_results_multi.csv"
     fieldnames = [
         "experiment", "group", "filter", "train_reduction",
-        "test_mean", "test_std", "test_n", "steps", "wall_s", "per_pair_reductions",
+        "test_mean", "test_std", "test_n", "steps", "wall_s", "converged", "per_pair_reductions",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -318,7 +290,7 @@ def main() -> None:
         for r in all_results:
             writer.writerow(r)
     print(f"\nResults saved to {csv_path}")
-    print(f"MLflow UI: mlflow ui --backend-store-uri {MLFLOW_TRACKING_URI}")
+    print(f"Per-epoch metrics in {RUNS_DIR}/<exp>/<group>__<filter>/metrics.jsonl")
 
     for exp_name, _ in experiments:
         print_full_table(all_results, exp_name)

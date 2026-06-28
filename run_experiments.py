@@ -25,7 +25,7 @@ import torch
 
 from src.calibration import (
     CalibrationConfig,
-    calibrate_multi,
+    calibrate_epochs,
     _forward_filtered,
     compute_reference_activations,
     group_loss,
@@ -58,7 +58,7 @@ LAYER_GROUPS = {
     "projector": ["backbone.projector"],
 }
 
-MAX_STEPS = 100
+MAX_EPOCHS = 20
 LR = 5e-3
 REG_WEIGHT = 0.01
 INPUT_SIZE = 384
@@ -165,17 +165,17 @@ def run_experiment(exp_name: str, exp_dir: Path, model: Any) -> List[Dict]:
 
             filt = build_filter(spec)
             cfg = CalibrationConfig(
-                max_steps=MAX_STEPS,
-                early_stopping_patience=15,
+                max_epochs=MAX_EPOCHS,
+                early_stopping_patience=5,
                 learning_rate=LR,
                 reg_weight=REG_WEIGHT,
-                log_every=0,
+                log_every=5,
                 seed=42,
             )
 
             t0 = time.time()
             try:
-                trained, result = calibrate_multi(
+                trained, result = calibrate_epochs(
                     filt, train_pairs, layer_names,
                     model=model, cfg=cfg,
                     test_pairs=test_pairs,

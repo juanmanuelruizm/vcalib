@@ -56,11 +56,19 @@ def _make_nested_tensor(x: torch.Tensor) -> "Any":
 
 @dataclass
 class CalibrationConfig:
-    """Optimizer + loop hyperparameters (mirrors ``configs/grid.yaml::training``)."""
+    """Optimizer + loop hyperparameters (mirrors ``configs/grid.yaml::training``).
+
+    Two modes for ``calibrate_multi``:
+    - Step-based (default): ``max_steps`` total optimizer steps; early stopping and
+      logging are per-step.
+    - Epoch-based: set ``max_epochs`` (each epoch = one full pass over all train pairs).
+      ``max_steps`` is ignored. Early stopping patience and logging are per-epoch.
+    """
 
     optimizer: str = "adam"
     learning_rate: float = 1e-3
     max_steps: int = 100
+    max_epochs: Optional[int] = None
     early_stopping_patience: int = 10
     reg_weight: float = 0.0
     metric: str = "l2_rel"  # "l2_rel" | "cosine"
@@ -458,6 +466,151 @@ def calibrate_multi(
         steps=step,
         wall_clock_s=wall,
         final_train_loss=last_loss,
+        final_val_loss=val_history[-1] if val_history else None,
+        train_history=train_history,
+        val_history=val_history,
+        converged=converged,
+    )
+    result.__dict__["baseline_train"] = baseline_train
+    result.__dict__["baseline_val"] = baseline_val
+    return filt, result
+
+
+def calibrate_epochs(
+    filt: torch.nn.Module,
+    train_pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+    layer_names: Sequence[str],
+    model: Any,
+    cfg: Optional[CalibrationConfig] = None,
+    test_pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+) -> Tuple[torch.nn.Module, CalibrationResult]:
+    """Train ``filt`` on MULTIPLE A/B pairs with an epoch-based loop.
+
+    Each epoch is one full shuffled pass over all train pairs. Validation and early
+    stopping are evaluated once per epoch (not per step), so patience is in epochs.
+    ``train_history`` and ``val_history`` in the returned result contain one entry per
+    epoch (mean loss over the epoch's steps).
+
+    Args:
+        filt: Filter to train.
+        train_pairs: List of (A, B) tuples, each (3, H, W) [0, 1] tensors.
+        layer_names: Layer group for the loss.
+        model: Pre-loaded LibreRFDETR wrapper.
+        cfg: Hyperparameters. ``cfg.max_epochs`` sets the epoch limit (required).
+            ``cfg.early_stopping_patience`` is patience in epochs.
+        test_pairs: Optional held-out pairs for val-based early stopping.
+
+    Returns:
+        (trained filter, CalibrationResult). ``result.steps`` = total optimizer steps.
+    """
+    import random
+
+    cfg = cfg or CalibrationConfig()
+    if cfg.max_epochs is None:
+        raise ValueError("calibrate_epochs requires cfg.max_epochs to be set")
+
+    torch.manual_seed(cfg.seed)
+    rng = random.Random(cfg.seed)
+    dev = _model_device(model)
+
+    filt = filt.to(dev)
+    filt.train()
+    for p in filt.parameters():
+        p.requires_grad_(True)
+
+    n = len(train_pairs)
+    print(f"  [calibrate_epochs] precomputing A activations for {n} train pairs...")
+    a_acts_all: List[Dict[str, torch.Tensor]] = []
+    for i, (a_unit, _) in enumerate(train_pairs):
+        a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+        if (i + 1) % 20 == 0 or (i + 1) == n:
+            print(f"    A activations: {i+1}/{n}")
+
+    test_a_acts_all: List[Dict[str, torch.Tensor]] = []
+    if test_pairs:
+        print(f"  [calibrate_epochs] precomputing A activations for {len(test_pairs)} test pairs...")
+        for a_unit, _ in test_pairs:
+            test_a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+
+    opt = torch.optim.Adam(filt.parameters(), lr=cfg.learning_rate)
+
+    best_val = float("inf")
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+    patience_left = cfg.early_stopping_patience
+    train_history: List[float] = []  # one entry per epoch (mean over steps)
+    val_history: List[float] = []    # one entry per epoch
+    t0 = time.time()
+    total_steps = 0
+    converged = False
+    baseline_train: Optional[float] = None
+    baseline_val: Optional[float] = None
+
+    for epoch in range(1, cfg.max_epochs + 1):
+        order = list(range(n))
+        rng.shuffle(order)
+        epoch_losses: List[float] = []
+
+        for pair_idx in order:
+            a_acts = a_acts_all[pair_idx]
+            _, b_unit = train_pairs[pair_idx]
+
+            opt.zero_grad(set_to_none=True)
+            b_acts = _forward_filtered(model, filt, b_unit, layer_names)
+            loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation)
+            if cfg.reg_weight > 0:
+                loss = loss + cfg.reg_weight * cast(Any, filt).reg_loss()
+            loss.backward()
+            opt.step()
+            epoch_losses.append(float(loss.detach()))
+            total_steps += 1
+
+        epoch_train_loss = sum(epoch_losses) / len(epoch_losses)
+        train_history.append(epoch_train_loss)
+        if baseline_train is None:
+            baseline_train = epoch_train_loss
+
+        # Validation: mean over all test pairs
+        v_loss: Optional[float] = None
+        if test_pairs and test_a_acts_all:
+            vlosses = []
+            for ti, (_, tb_unit) in enumerate(test_pairs):
+                vb_acts = _forward_filtered(model, filt, tb_unit, layer_names)
+                vl = group_loss(test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation)
+                vlosses.append(float(vl.detach()))
+            v_loss = sum(vlosses) / len(vlosses)
+            val_history.append(v_loss)
+            if baseline_val is None:
+                baseline_val = v_loss
+
+        # Early stopping (epoch-level)
+        monitor = v_loss if v_loss is not None else epoch_train_loss
+        if monitor < best_val - 1e-7:
+            best_val = monitor
+            best_state = {k: v.detach().clone() for k, v in filt.state_dict().items()}
+            patience_left = cfg.early_stopping_patience
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                converged = True
+                if cfg.log_every and epoch % cfg.log_every == 0:
+                    tag = f"val={v_loss:.5f} " if v_loss is not None else ""
+                    print(f"  [calibrate_epochs] epoch {epoch:4d} train={epoch_train_loss:.5f} {tag}→ early stop")
+                break
+
+        if cfg.log_every and epoch % cfg.log_every == 0:
+            tag = f"val={v_loss:.5f} " if v_loss is not None else ""
+            print(f"  [calibrate_epochs] epoch {epoch:4d} train={epoch_train_loss:.5f} {tag}patience={patience_left}")
+
+    wall = time.time() - t0
+    if best_state is not None:
+        filt.load_state_dict(best_state)
+    filt.eval()
+
+    result = CalibrationResult(
+        filter_state={k: v.detach().cpu().clone() for k, v in filt.state_dict().items()},
+        steps=total_steps,
+        wall_clock_s=wall,
+        final_train_loss=train_history[-1] if train_history else float("inf"),
         final_val_loss=val_history[-1] if val_history else None,
         train_history=train_history,
         val_history=val_history,

@@ -128,12 +128,42 @@
 
 - [x] **A17. Doc alignment with advanced-filter spec** — done (see Phase A above).
 
----
+## Phase B — Config-Driven Experiment Runner
+
+> See `docs/specs/2026-06-28-config-driven-experiments.md`.
+> Goal: detach experiment **configuration** from **execution**. Each YAML = one atomic run
+> (1 filter × 1 layer group × 1 dataset). The runner globs N YAMLs and aggregates rows into
+> one CSV. Replaces the hardcoded `FILTERS`/`LAYER_GROUPS`/hyperparams in `run_experiments.py`.
+
+- [x] **B1. Config schema + loader (`src/experiment_config.py`)**
+  - `ExperimentConfig` + `TrainingConfig` dataclasses parsed from YAML
+  - `load_config(path)` / `load_configs(paths)` (file, directory glob, or iterable)
+  - Validation: name non-empty + unique, dataset exists (skippable for `--dry-run`), filter type in registry, layer names valid, training fields positive
+  - Layer range syntax (`backbone.layer.0..3`) expands via `expand_layer_spec`
+  - Composite filters rejected (one filter per YAML)
+
+- [x] **B2. Runner (`run_configs.py`)**
+  - CLI: `run_configs.py PATH... [--output DIR] [--dry-run] [--append] [--device cuda|cpu]`
+  - Loads model once; iterates configs; runs `calibrate_epochs` + `evaluate_on_test` per config
+  - Per-epoch `metrics.jsonl` + periodic `epoch_NNNN.pt` + `best.pt` under `runs/<name>/`
+  - Aggregated CSV at `results/experiments/experiment_results.csv` (incremental write)
+  - `--dry-run` validates all configs, prints resolved run matrix, exits without loading model
+  - Sorted results table printed at end
+
+- [x] **B3. Starter configs + generator (`configs/experiments/`, `scripts/generate_experiment_configs.py`)**
+  - 60 YAMLs reproducing the `run_experiments.py` sweep (10 filters × 3 groups × 2 datasets)
+  - Generator is idempotent; safe to re-run
+
+- [x] **B4. `run_experiments.py` deprecation note**
+
+- [x] **B5. Tests (`tests/test_experiment_config.py`)** — 17 tests (parse, validation, reject, glob, duplicate, dry-run subprocess)
+
+- [x] **B6. Verification** — `ruff check` + `ruff format` + `mypy src/experiment_config.py` clean; `pytest tests/test_experiment_config.py tests/test_data_pairs.py -v` 27 pass; `run_configs.py configs/experiments/ --dry-run` prints 60 configs and exits 0.
 
 ### Current Status
-- **Phase A complete.** All code built and verified: A1 (env+model), A2 (activations), A3 (initial filters), A3b (`reg_loss()`), A4 (calibration loop), A8 (stand-in data), A9–A15 (7 advanced filters F1–F7), A16 (registry+grid), A17 (docs). 211 tests pass (203 fast + 8 slow smoke). 18 filters in `FILTER_REGISTRY`, 35 layer groups, overfit gate + reg_weight wired into `configs/grid.yaml`. Slow smoke results: `ccm_high_order` and `spatial_tone_curve` pass the overfit gate; `lut_3d` (N=9) gets highest train (64.7%) but overfits (val/train 0.20) — the gate works.
-- **Ready for Phase 0 (capture) → Phase 1 (diagnostics) → Phase 2 (grid search).** Data loader (`src/utils/data_pairs.py`), diagnostics script (`src/diagnostics.py`), and grid executor (`src/grid_search.py`) are built and ready to run on real A/B pairs.
+- **Phase A complete.** All code built and verified (see above for detail).
+- **Phase B complete (2026-06-28).** Config-driven experiment runner landed: `src/experiment_config.py`, `run_configs.py`, 60 starter YAMLs in `configs/experiments/`, `scripts/generate_experiment_configs.py`, `tests/test_experiment_config.py` (17 tests). `run_configs.py configs/experiments/` is the new entry point; `run_experiments.py` is deprecated.
 ### Next Action
-- **Phase 0:** Carlos captures the dev dataset (20–30 scenes × 3–5 levels) following the layout in A7. Then: `uv run python src/diagnostics.py --dataset-path data/raw/scenes_YYYYMMDD/ --output results/phase1_diagnostics.json --plot`
+- Run the full sweep: `uv run python run_configs.py configs/experiments/` (or any subset). Note: `level_1_vs_level_3` is not materialized on the current Windows checkout — only `level_1_vs_level_2` runs until that dataset is re-captured or re-checked-out.
 
-**Last Updated:** 2026-06-27 · **Owner:** Carlos
+**Last Updated:** 2026-06-28 · **Owner:** Carlos

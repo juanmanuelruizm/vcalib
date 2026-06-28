@@ -37,16 +37,20 @@ env/
 # Project-specific
 .claude/worktrees/
 .claude/settings.local.json
+session-ses_*.md
 
 # Data & results (generated)
 data/raw
 data/processed/
 data/augmented/
 data/datasets/
-results/
+results/**/*.pt
+results/*.log
 *.csv
 *.json
 *.log
+*.html
+!results/visual_report.html
 
 # Temporary
 *.tmp

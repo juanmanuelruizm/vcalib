@@ -17,6 +17,7 @@ Filter library (params):
 - ``spatial_brightness`` / ``spatial_whitebalance`` / ``spatial_affine`` / ``spatial_gamma``
   — bilinear K×K control-grid variants of the above (zone-dependent; params = K²·n_field)
 - ``composite`` — ordered chain (variable params)
+- ``neural_pixel`` — pixel-wise residual MLP (universal approximator, no fixed form)
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from .local_tonemap import LocalTonemap
 from .lut_3d import LUT3D
 from .lut_3d_lowrank import LUT3DLowRank
 from .matrix_12param import Matrix12Param
+from .neural_pixel import NeuralPixelFilter
 from .saturation_1param import Saturation
 from .spatial import SpatialAffine, SpatialBrightness, SpatialGamma, SpatialWhiteBalance
 from .spatial_tone_curve import SpatialToneCurve
@@ -62,6 +64,7 @@ __all__ = [
     "SpatialToneCurve",
     "LocalTonemap",
     "LUT3DLowRank",
+    "NeuralPixelFilter",
     "FILTER_REGISTRY",
     "get_filter",
     "make_composite",
@@ -86,6 +89,7 @@ FILTER_REGISTRY: Dict[str, Callable[[], Filter]] = {
     "spatial_tone_curve": SpatialToneCurve,
     "local_tonemap": LocalTonemap,
     "lut_3d_lowrank": LUT3DLowRank,
+    "neural_pixel": NeuralPixelFilter,
 }
 
 

@@ -63,20 +63,34 @@ class CalibrationConfig:
       logging are per-step.
     - Epoch-based: set ``max_epochs`` (each epoch = one full pass over all train pairs).
       ``max_steps`` is ignored. Early stopping patience and logging are per-epoch.
+
+    Scheduler (epoch-based only):
+    - ``scheduler="cosine"``: CosineAnnealingLR. Defaults: T_max=max_epochs, eta_min=1e-6.
+    - ``scheduler="step"``: StepLR. Defaults: step_size=max_epochs//3, gamma=0.1.
+    - Any extra kwargs go in ``scheduler_kwargs`` and override the defaults.
+
+    Weighted layer loss:
+    - ``layer_weights``: dict mapping layer name → weight. Weights are L1-normalised
+      internally so they always sum to 1 regardless of the values provided. Layers absent
+      from the dict receive weight 1.0 before normalisation.
     """
 
-    optimizer: str = "adam"
+    optimizer: str = "adam"       # "adam" | "adamw"
     learning_rate: float = 1e-3
+    weight_decay: float = 0.0     # used only with "adamw"
     max_steps: int = 100
     max_epochs: Optional[int] = None
     early_stopping_patience: int = 10
     reg_weight: float = 0.0
-    metric: str = "l2_rel"  # "l2_rel" | "cosine"
-    aggregation: str = "mean"  # "mean" | "sum"
+    metric: str = "l2_rel"        # "l2_rel" | "cosine"
+    aggregation: str = "mean"     # "mean" | "sum"
     seed: int = 42
     log_every: int = 10
     loss_mode: str = "activation"  # "activation" | "combined" | "detection"
     detection_weight: float = 1.0  # β in combined mode
+    scheduler: Optional[str] = None            # "cosine" | "step" | None
+    scheduler_kwargs: Dict[str, Any] = field(default_factory=dict)
+    layer_weights: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -118,14 +132,27 @@ def group_loss(
     layer_names: Sequence[str],
     metric: str = "l2_rel",
     aggregation: str = "mean",
+    layer_weights: Optional[Dict[str, float]] = None,
 ) -> torch.Tensor:
-    """Aggregate per-layer normalized distance across the layer group."""
+    """Aggregate per-layer normalized distance across the layer group.
+
+    If ``layer_weights`` is provided, each layer's distance is multiplied by its
+    weight before aggregation. Weights are L1-normalised so they always sum to 1;
+    layers absent from the dict receive weight 1.0 before normalisation.
+    """
     dists: List[torch.Tensor] = []
+    weights: List[float] = []
     for name in layer_names:
         if name not in a_acts or name not in b_acts:
             raise KeyError(f"Layer {name!r} missing from activations (have {sorted(b_acts)})")
         dists.append(_per_layer_distance(a_acts[name], b_acts[name], metric))
+        weights.append(layer_weights.get(name, 1.0) if layer_weights else 1.0)
+
     stacked = torch.stack(dists)
+    if layer_weights is not None:
+        w = torch.tensor(weights, dtype=stacked.dtype, device=stacked.device)
+        w = w / w.sum().clamp(min=EPS)
+        return (stacked * w).sum()
     return stacked.mean() if aggregation == "mean" else stacked.sum()
 
 
@@ -603,7 +630,25 @@ def calibrate_epochs(
             else:
                 test_a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
 
-    opt = torch.optim.Adam(filt.parameters(), lr=cfg.learning_rate)
+    if cfg.optimizer == "adamw":
+        opt: torch.optim.Optimizer = torch.optim.AdamW(
+            filt.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
+        )
+    else:
+        opt = torch.optim.Adam(filt.parameters(), lr=cfg.learning_rate)
+
+    # Optional LR scheduler (epoch-level, only meaningful for calibrate_epochs).
+    sched: Optional[Any] = None
+    if cfg.scheduler == "cosine":
+        kw = {"T_max": cfg.max_epochs, "eta_min": 1e-6}
+        kw.update(cfg.scheduler_kwargs)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, **kw)
+    elif cfg.scheduler == "step":
+        kw = {"step_size": max(1, (cfg.max_epochs or 1) // 3), "gamma": 0.1}
+        kw.update(cfg.scheduler_kwargs)
+        sched = torch.optim.lr_scheduler.StepLR(opt, **kw)
+    elif cfg.scheduler is not None:
+        raise ValueError(f"Unknown scheduler {cfg.scheduler!r}; expected 'cosine', 'step', or None")
 
     best_val = float("inf")
     best_state: Optional[Dict[str, torch.Tensor]] = None
@@ -632,18 +677,21 @@ def calibrate_epochs(
                 if cfg.loss_mode == "detection":
                     loss = detection_output_loss(a_det, b_det)
                 else:  # combined
-                    feat_loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation)
+                    feat_loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation, cfg.layer_weights)
                     det_loss = detection_output_loss(a_det, b_det)
                     loss = feat_loss + cfg.detection_weight * det_loss
             else:
                 b_acts = _forward_filtered(model, filt, b_unit, layer_names)
-                loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation)
+                loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation, cfg.layer_weights)
             if cfg.reg_weight > 0:
                 loss = loss + cfg.reg_weight * cast(Any, filt).reg_loss()
             loss.backward()
             opt.step()
             epoch_losses.append(float(loss.detach()))
             total_steps += 1
+
+        if sched is not None:
+            sched.step()
 
         epoch_train_loss = sum(epoch_losses) / len(epoch_losses)
         train_history.append(epoch_train_loss)
@@ -662,13 +710,13 @@ def calibrate_epochs(
                         vl = detection_output_loss(ta_det, vb_det)
                     else:  # combined
                         feat_vl = group_loss(
-                            test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation
+                            test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation, cfg.layer_weights
                         )
                         det_vl = detection_output_loss(ta_det, vb_det)
                         vl = feat_vl + cfg.detection_weight * det_vl
                 else:
                     vb_acts = _forward_filtered(model, filt, tb_unit, layer_names)
-                    vl = group_loss(test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation)
+                    vl = group_loss(test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation, cfg.layer_weights)
                 vlosses.append(float(vl.detach()))
             v_loss = sum(vlosses) / len(vlosses)
             val_history.append(v_loss)

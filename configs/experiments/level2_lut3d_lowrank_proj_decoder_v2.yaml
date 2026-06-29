@@ -1,0 +1,25 @@
+name: level2_lut3d_lowrank_proj_decoder_v2
+dataset: data/datasets/level_1_vs_level_2
+input_size: 384
+filter:
+  type: lut_3d_lowrank
+  M: 32
+layer_group:
+  name: proj+decoder
+  layers:
+  - backbone.projector
+  - decoder.layer.0
+  - decoder.layer.1
+training:
+  max_epochs: 80
+  learning_rate: 0.001
+  reg_weight: 0.005
+  early_stopping_patience: 15
+  seed: 42
+  checkpoint_every: 10
+  scheduler: cosine
+  scheduler_kwargs:
+    T_max: 80
+    eta_min: 1.0e-06
+output:
+  results_dir: results/experiments

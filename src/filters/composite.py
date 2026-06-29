@@ -9,7 +9,7 @@ class), so intermediate values may briefly leave [0, 1] between stages.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable
 
 import torch
 
@@ -21,7 +21,7 @@ class CompositeFilter(Filter):
 
     def __init__(self, filters: Iterable[Filter]) -> None:
         super().__init__()
-        self.filters: List[Filter] = list(filters)
+        self.filters = torch.nn.ModuleList(list(filters))
         if not self.filters:
             raise ValueError("CompositeFilter requires at least one sub-filter")
 

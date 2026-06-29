@@ -181,6 +181,11 @@ def run_one(
         log_every=5,
         loss_mode=cfg.training.loss_mode,
         detection_weight=cfg.training.detection_weight,
+        optimizer=cfg.training.optimizer,
+        weight_decay=cfg.training.weight_decay,
+        scheduler=cfg.training.scheduler,
+        scheduler_kwargs=cfg.training.scheduler_kwargs,
+        layer_weights=cfg.training.layer_weights,
     )
 
     trained, result = calibrate_epochs(

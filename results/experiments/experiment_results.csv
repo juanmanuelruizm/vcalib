@@ -295,3 +295,7 @@ det_stc_combined_lv2,level_1_vs_level_2,projector,"spatial_tone_curve(P=16,grid_
 det_stc_combined_lv3,level_1_vs_level_3,projector,"spatial_tone_curve(P=16,grid_size=5)",combined,0.0820,0.0973,0.0724,6,5904,175.8,True,0.2414;0.0582;0.1287;0.0855;0.0238;0.0461
 det_stc_detection_lv2,level_1_vs_level_2,projector,"spatial_tone_curve(P=16,grid_size=5)",detection,0.1664,0.1728,0.0448,6,943,30.7,True,0.2138;0.1972;0.1134;0.1525;0.1264;0.2334
 det_stc_detection_lv3,level_1_vs_level_3,projector,"spatial_tone_curve(P=16,grid_size=5)",detection,0.0770,0.1097,0.0660,6,2736,85.7,True,0.2147;0.1001;0.1540;0.0985;-0.0028;0.0940
+level3_lut3d_lowrank_backbone_late_proj_v2,level_1_vs_level_3,backbone.late+proj,lut_3d_lowrank(M=32),,0.0557,0.0488,0.0193,6,11520,180.1,False,0.0275;0.0759;0.0468;0.0514;0.0231;0.0681
+level3_lut3d_lowrank_backbone_mid_v2,level_1_vs_level_3,backbone.mid,lut_3d_lowrank(M=32),,0.0042,0.0037,0.0042,6,5760,76.5,True,-0.0005;0.0059;0.0073;0.0037;-0.0031;0.0085
+level3_lut3d_lowrank_proj_decoder_v2,level_1_vs_level_3,proj+decoder,lut_3d_lowrank(M=32),,0.0080,0.0055,0.0138,6,3312,53.7,True,-0.0123;0.0185;0.0092;0.0266;-0.0041;-0.0049
+level3_lut3d_lowrank_projector_v2,level_1_vs_level_3,projector,lut_3d_lowrank(M=32),,0.0674,0.0552,0.0188,6,6192,85.8,True,0.0260;0.0656;0.0450;0.0792;0.0423;0.0730

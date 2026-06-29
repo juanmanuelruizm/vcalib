@@ -1,0 +1,28 @@
+name: level3_composite_chromatic_tone_backbone_late_proj_v2
+dataset: data/datasets/level_1_vs_level_3
+input_size: 384
+filter:
+  composite:
+  - chromatic_adaptation
+  - tone_curve
+layer_group:
+  name: backbone.late+proj
+  layers:
+  - backbone.layer.8
+  - backbone.layer.9
+  - backbone.layer.10
+  - backbone.layer.11
+  - backbone.projector
+training:
+  max_epochs: 80
+  learning_rate: 0.001
+  reg_weight: 0.005
+  early_stopping_patience: 15
+  seed: 42
+  checkpoint_every: 10
+  scheduler: cosine
+  scheduler_kwargs:
+    T_max: 80
+    eta_min: 1.0e-06
+output:
+  results_dir: results/experiments

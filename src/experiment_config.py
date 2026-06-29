@@ -32,7 +32,7 @@ Layer range syntax (``backbone.layer.0..3`` -> four names) is supported via
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
@@ -40,7 +40,7 @@ from src.filters import FILTER_REGISTRY
 from src.utils.layer_groups import expand_layer_spec
 
 
-@dataclass(frozen=True)
+@dataclass
 class TrainingConfig:
     """Optimizer + loop hyperparameters for one run."""
 
@@ -52,6 +52,11 @@ class TrainingConfig:
     checkpoint_every: int = 5
     loss_mode: str = "activation"  # "activation" | "combined" | "detection"
     detection_weight: float = 1.0  # β in combined mode
+    optimizer: str = "adam"                     # "adam" | "adamw"
+    weight_decay: float = 0.0                   # used only with "adamw"
+    scheduler: Optional[str] = None             # "cosine" | "step" | None
+    scheduler_kwargs: Dict[str, Any] = field(default_factory=dict)
+    layer_weights: Optional[Dict[str, float]] = None
 
 
 @dataclass(frozen=True)
@@ -70,7 +75,9 @@ class ExperimentConfig:
 
     @property
     def filter_display(self) -> str:
-        """Human-readable filter label (e.g. ``lut_3d(size=9)``)."""
+        """Human-readable filter label (e.g. ``lut_3d(size=9)`` or ``affine_6param+gamma_3param``)."""
+        if "composite" in self.filter_spec:
+            return "+".join(str(s) for s in self.filter_spec["composite"])
         name = str(self.filter_spec["type"])
         extras = {k: v for k, v in self.filter_spec.items() if k != "type"}
         if extras:
@@ -88,10 +95,18 @@ def _validate_filter(raw_filter: Any, config_file: Path) -> Dict[str, Any]:
     if not isinstance(raw_filter, Mapping):
         raise ValueError(f"Config {config_file!s}: 'filter' must be a mapping")
     if "composite" in raw_filter:
-        raise ValueError(
-            f"Config {config_file!s}: experiment configs use a single filter, not a composite. "
-            "Set 'filter.type' to the filter name."
-        )
+        stages = raw_filter["composite"]
+        if not isinstance(stages, list) or not stages:
+            raise ValueError(
+                f"Config {config_file!s}: 'filter.composite' must be a non-empty list of filter names"
+            )
+        for s in stages:
+            if not isinstance(s, str) or s not in FILTER_REGISTRY:
+                raise ValueError(
+                    f"Config {config_file!s}: unknown composite stage {s!r}. "
+                    f"Valid: {sorted(FILTER_REGISTRY)}"
+                )
+        return dict(raw_filter)
     if "type" not in raw_filter or not isinstance(raw_filter["type"], str):
         raise ValueError(f"Config {config_file!s}: 'filter.type' is required and must be a string")
     ftype = raw_filter["type"]
@@ -130,16 +145,27 @@ def _validate_training(raw_training: Any, config_file: Path) -> TrainingConfig:
     if not isinstance(raw_training, Mapping):
         raise ValueError(f"Config {config_file!s}: 'training' must be a mapping")
     _VALID_LOSS_MODES = {"activation", "combined", "detection"}
+    defaults = TrainingConfig()
     try:
-        max_epochs = int(raw_training.get("max_epochs", TrainingConfig().max_epochs))
-        learning_rate = float(raw_training.get("learning_rate", TrainingConfig().learning_rate))
-        reg_weight = float(raw_training.get("reg_weight", TrainingConfig().reg_weight))
+        max_epochs = int(raw_training.get("max_epochs", defaults.max_epochs))
+        learning_rate = float(raw_training.get("learning_rate", defaults.learning_rate))
+        reg_weight = float(raw_training.get("reg_weight", defaults.reg_weight))
         early_stopping_patience = int(
-            raw_training.get("early_stopping_patience", TrainingConfig().early_stopping_patience)
+            raw_training.get("early_stopping_patience", defaults.early_stopping_patience)
         )
-        seed = int(raw_training.get("seed", TrainingConfig().seed))
-        checkpoint_every = int(
-            raw_training.get("checkpoint_every", TrainingConfig().checkpoint_every)
+        seed = int(raw_training.get("seed", defaults.seed))
+        checkpoint_every = int(raw_training.get("checkpoint_every", defaults.checkpoint_every))
+        optimizer = str(raw_training.get("optimizer", defaults.optimizer))
+        weight_decay = float(raw_training.get("weight_decay", defaults.weight_decay))
+        scheduler_raw = raw_training.get("scheduler", defaults.scheduler)
+        scheduler: Optional[str] = str(scheduler_raw) if scheduler_raw is not None else None
+        scheduler_kwargs_raw = raw_training.get("scheduler_kwargs", {})
+        scheduler_kwargs: Dict[str, Any] = dict(scheduler_kwargs_raw) if scheduler_kwargs_raw else {}
+        layer_weights_raw = raw_training.get("layer_weights", None)
+        layer_weights: Optional[Dict[str, float]] = (
+            {str(k): float(v) for k, v in layer_weights_raw.items()}
+            if layer_weights_raw is not None
+            else None
         )
         loss_mode = str(raw_training.get("loss_mode", TrainingConfig().loss_mode))
         detection_weight = float(
@@ -163,6 +189,14 @@ def _validate_training(raw_training: Any, config_file: Path) -> TrainingConfig:
         )
     if detection_weight <= 0:
         raise ValueError(f"Config {config_file!s}: training.detection_weight must be > 0")
+    if optimizer not in ("adam", "adamw"):
+        raise ValueError(f"Config {config_file!s}: training.optimizer must be 'adam' or 'adamw'")
+    if weight_decay < 0:
+        raise ValueError(f"Config {config_file!s}: training.weight_decay must be >= 0")
+    if scheduler not in (None, "cosine", "step"):
+        raise ValueError(
+            f"Config {config_file!s}: training.scheduler must be 'cosine', 'step', or null"
+        )
     return TrainingConfig(
         max_epochs=max_epochs,
         learning_rate=learning_rate,
@@ -172,6 +206,11 @@ def _validate_training(raw_training: Any, config_file: Path) -> TrainingConfig:
         checkpoint_every=checkpoint_every,
         loss_mode=loss_mode,
         detection_weight=detection_weight,
+        optimizer=optimizer,
+        weight_decay=weight_decay,
+        scheduler=scheduler,
+        scheduler_kwargs=scheduler_kwargs,
+        layer_weights=layer_weights,
     )
 
 

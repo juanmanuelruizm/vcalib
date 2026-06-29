@@ -52,6 +52,17 @@ results/*.log
 *.html
 !results/visual_report.html
 
+# Images (binary assets)
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
+*.png
+*.PNG
+*.bmp
+*.gif
+*.webp
+
 # Temporary
 *.tmp
 .pytest_cache/

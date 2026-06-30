@@ -100,6 +100,22 @@ And it converges fast — most of the recovery lands in the first ~15 epochs (re
 
 ---
 
+## Does it recover *detection*, not just activations?
+
+Activation distance is a proxy. The question a practitioner actually cares about is whether the model *detects the same things* under the shift. We measure this **without any hand labels**: we treat the frozen model's own detections under the reference condition **A** as the target, and ask how far the detection outputs (class logits + boxes) drift under **B** vs. `filter(B)`.
+
+On the 6 held-out real scenes, a filter calibrated against the detection objective pulls the detection outputs **20.4% closer to A** — every scene improves:
+
+![Detection-output recovery](docs/images/detection_recovery.png)
+
+And there's a clean, honest lesson in the data: **what you optimize is what you recover.** The activation-trained filter is great at activation recovery (35.9%) but only modestly recovers detection outputs (9.5%); calibrating against the detection objective roughly doubles detection recovery (20.4%).
+
+![What you optimize is what you recover](docs/images/objective_comparison.png)
+
+> This is detection-*output* agreement against a self-supervised reference — strong evidence that the effect reaches the detection head, but not yet a mAP number against human-annotated ground truth. That last step is what closes the loop (see below).
+
+---
+
 ## Results (200-Config Sweep)
 
 > 10 filter types × 2 illumination levels × 10 layer groups, evaluated on 6 held-out test scenes (synthetically relighted, used as a fast proxy).
@@ -146,11 +162,12 @@ We'd rather be precise about what these numbers do and don't show.
 
 **✅ What's proven**
 - A tiny, label-free filter measurably pulls a frozen detector's internal representations back toward the reference condition — **35.9% on real held-out captured pairs**, 30.7% across a 200-config synthetic sweep.
+- The effect reaches the **detection head**: calibrating against the detection objective recovers **20.4%** of the detection-output drift on held-out real pairs (every scene improves), measured label-free against the model's own reference-condition detections.
 - It's cheap: thousands of params, minutes on a CPU, no model retraining, no labels.
-- The signal is robust: same ranking across filter families, layer groups, and shift magnitudes.
+- The signal is robust: same ranking across filter families, layer groups, and shift magnitudes — and *what you optimize is what you recover*.
 
 **🔧 What's next (the milestone that closes the loop)**
-- **Detection-metric recovery.** Activation distance is a strong *proxy*; the proof a practitioner wants is mAP / box-quality / confidence on real shifted data: *baseline vs. filter vs. full retrain*. We've started this — there are detection-loss calibration runs in `results/experiments/runs/det_*` — and it's the headline goal of Phase 3.
+- **mAP against human ground truth.** We've shown detection-*output* recovery against a self-supervised reference; the final proof is mAP / box-quality on **hand-annotated** shifted data, with a **full-retrain arm** as the upper-bound comparison.
 - **Per-condition generalization.** Confirm that one filter, fit once per environment, holds across a whole stream of frames (the deployment model above), not just per-image.
 - **Edge deploy CLI** to make "fit & swap a filter" a one-command operation.
 
@@ -165,7 +182,7 @@ No — and that's the point. Classic ISP corrections optimize for human-perceive
 You capture a small set of A/B pairs once per new environment, fit the filter offline, freeze it, and ship it. At inference you only run `filter(frame) → frozen model`. No reference is needed online.
 
 **Does it actually improve detection, or just activations?**
-Today we measure activation-distance recovery (a proxy) — see [What's proven vs. what's next](#whats-proven-vs-whats-next). Detection-metric recovery is the active milestone.
+Both. Beyond the 35.9% activation recovery, a detection-calibrated filter recovers **20.4%** of the drift in the model's *detection outputs* (class logits + boxes) on held-out real pairs — see [Does it recover detection?](#does-it-recover-detection-not-just-activations). The remaining step is mAP against human-annotated ground truth.
 
 **Why freeze the model instead of fine-tuning?**
 Cost and operations: no labels, minutes on CPU vs. GPU-hours, a 2 KB artifact vs. a new checkpoint, and one model + N swappable filters instead of N fine-tuned models to maintain.
@@ -340,7 +357,7 @@ The runner (`run_configs.py`) loads the model once, iterates configs, and writes
 | B | ✅ Complete | Config-driven experiment runner, YAML configs |
 | 1 | ✅ Complete | Diagnostic sweep + real-pair calibration (35.9% on held-out captures) |
 | 2 | ✅ Complete | 200-config grid sweep (filter × layer group × level) |
-| 3 | 🔧 In progress | Benchmark: **detection-metric** recovery vs. calibration cost |
+| 3 | 🔧 In progress | Detection recovery: 20.4% on detection outputs (held-out); mAP vs. human GT next |
 | D | 📋 Planned | Edge deploy CLI (`deploy_calibrate.py`) — fit & swap a filter |
 
 ---

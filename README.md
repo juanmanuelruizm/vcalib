@@ -10,9 +10,15 @@ RF-DETR is a state-of-the-art real-time object detector. Like most vision models
 
 **vcalib** learns a tiny preprocessing filter that undoes the illumination shift *before* the image reaches the model. No model weights are changed. Calibration takes seconds on a CPU.
 
+The images below show the same scene captured under three different real-world lighting conditions — the kind of shift that degrades detection performance:
+
+![Illumination triplet — same scene, three lighting conditions](docs/images/illumination_triplet.png)
+
 ---
 
 ## Approach
+
+![Pipeline diagram — differentiable calibration filter](docs/images/pipeline_diagram.png)
 
 ```
 Raw Image B (shifted illumination)
@@ -74,6 +80,8 @@ Adam optimizer → filter params updated, model frozen
 **1. Layer group matters more than filter type.**  
 The `projector` layer (backbone's multi-scale feature projector) gives the strongest signal across all filter types. Results degrade progressively from late → mid → early backbone layers.
 
+![Layer group comparison](docs/images/layer_group_comparison.png)
+
 | Layer Group | Best Test Reduction |
 |-------------|-------------------|
 | `projector` | **30.7%** |
@@ -84,6 +92,8 @@ The `projector` layer (backbone's multi-scale feature projector) gives the stron
 
 **2. Non-linear filters outperform linear ones.**  
 Spatial and tone-curve filters capture the non-linear, per-channel character of real illumination shifts better than affine transforms.
+
+![Filter type comparison](docs/images/filter_comparison.png)
 
 | Filter | Best Test Reduction |
 |--------|-------------------|
@@ -96,6 +106,10 @@ Spatial and tone-curve filters capture the non-linear, per-channel character of 
 
 **3. The signal generalizes across illumination levels.**  
 Results on `level_1→level_3` (stronger shift) are slightly lower but follow the same filter/group ranking, confirming that the approach is not dataset-specific.
+
+The heatmap below shows the full filter × layer-group matrix — green = better reduction:
+
+![Filter × layer group heatmap](docs/images/heatmap_filter_group.png)
 
 Full results: [`results/experiments/experiment_results.csv`](results/experiments/experiment_results.csv) — see [`docs/results_sweep_200.md`](docs/results_sweep_200.md) for the detailed breakdown.
 

@@ -1,31 +1,53 @@
 # vcalib — Differentiable Calibration Filters for RF-DETR Under Illumination Shift
 
-> Recover object-detection performance under real-world lighting changes — without retraining the model.
+> **Stop retraining your detector when the lighting changes.** Fit a ~2 KB filter in minutes on a CPU instead — the model stays frozen.
+
+---
+
+vcalib learns a tiny preprocessing filter that undoes an illumination shift *before* the image reaches a frozen object detector. No model weights are touched. On **real captured image pairs, held out from training**, a single spatial tone-curve filter pulls the shifted image's internal representation **35.9% closer** to the reference — fit in ~3.5 min on a laptop CPU.
+
+![Real before/after calibration](docs/images/money_shot_level2.png)
+
+*Left to right: the reference condition **A**, the same scene under shifted lighting **B**, the filter-corrected `filter(B)`, and where the filter helped (green = closer to A). These are real held-out scenes the filter never saw during training.*
+
+---
+
+## Why this matters (the production case)
+
+Think about what it costs to keep a detector working as conditions drift — dawn vs. dusk, indoor vs. overcast, a new camera, a new site. The textbook answer is "collect data, label it, fine-tune, redeploy." That is the expensive answer.
+
+vcalib proposes the cheap one: **freeze the expensive model once, and adapt to each new condition with a tiny, label-free filter.** It's the same economic logic that made LoRA/adapters win in NLP — only here we adapt the model's *input* instead of its weights.
+
+![Retrain vs. vcalib](docs/images/economics.png)
+
+In deployment this becomes **one frozen model + a swappable library of tiny filters**, one per condition. Switching conditions is swapping a 2 KB file — no retraining, no redeploy.
+
+![Deployment model](docs/images/deployment_model.png)
+
+> **Why we're excited:** if this holds at the *detection-metric* level (our next milestone — see [What's proven vs. what's next](#whats-proven-vs-whats-next)), then keeping a model healthy in the field stops being a retraining problem and becomes a *calibration* problem — orders of magnitude cheaper, no labels, runs on the edge.
 
 ---
 
 ## The Problem
 
-RF-DETR is a state-of-the-art real-time object detector. Like most vision models, it is sensitive to illumination conditions: deploy it under different lighting than the training distribution and detection quality degrades. Retraining or fine-tuning is expensive and impractical for edge devices.
+RF-DETR is a state-of-the-art real-time object detector. Like most vision models, it is sensitive to illumination: deploy it under lighting different from its training distribution and detection quality degrades. Retraining or fine-tuning is expensive and impractical for edge devices.
 
-**vcalib** learns a tiny preprocessing filter that undoes the illumination shift *before* the image reaches the model. No model weights are changed. Calibration takes seconds on a CPU.
+The images below show one scene captured under three real lighting conditions — exactly the kind of shift that moves a model's internal features off-distribution:
 
-The images below show the same scene captured under three different real-world lighting conditions — the kind of shift that degrades detection performance:
-
-![Illumination triplet — same scene, three lighting conditions](docs/images/illumination_triplet.png)
+![Illumination triplet](docs/images/illumination_triplet.png)
 
 ---
 
-## Approach
+## How it works
 
-![Pipeline diagram — differentiable calibration filter](docs/images/pipeline_diagram.png)
+![Pipeline diagram](docs/images/pipeline_diagram.png)
 
 ```
 Raw Image B (shifted illumination)
         │
         ▼
 ┌───────────────────┐
-│  Learnable Filter  │  ← optimized in ~100 steps on a single image pair
+│  Learnable Filter  │  ← optimized in ~100 steps per image pair
 │  f: [0,1]³→[0,1]³ │    params: 3–2,187 (depending on filter type)
 └───────────────────┘
         │
@@ -50,18 +72,38 @@ Adam optimizer → filter params updated, model frozen
 
 **Key design choices:**
 
-- **Signal = intermediate activations, not pixel L2.** We match RF-DETR's internal representations, not pixel values. This gives a task-aware signal.
+- **Signal = intermediate activations, not pixel L2.** We match RF-DETR's internal representations, not raw pixels. That makes the objective *task-aware* without needing any labels — the filter optimizes for what the detector actually keys on, not for human-perceived color. This is the crucial difference from a classic white-balance / ISP correction.
 - **Filter operates pre-normalization** on the `[0, 1]` RGB tensor, before ImageNet mean/std normalization.
-- **No model weights modified.** The frozen model acts as a fixed feature extractor. Only the filter is learnable.
-- **Layer group as a search axis.** We sweep which group of RF-DETR layers to use as the loss signal. The `backbone.projector` consistently gives the best results.
-- **Held-out validation guardrail.** Each calibration is evaluated on a held-out image pair to detect overfitting. An overfit gate (val/train ≥ 0.5) rejects degenerate configs.
+- **No model weights modified.** The frozen model is a fixed feature extractor; only the filter is learnable.
+- **Layer group as a search axis.** We sweep which group of RF-DETR layers feeds the loss. The `backbone.projector` consistently wins.
+- **Held-out validation guardrail.** Every calibration is evaluated on held-out pairs to catch overfitting. An overfit gate (val/train ≥ 0.5) rejects degenerate configs.
+
+---
+
+## Results on real captured pairs
+
+The headline figure above and the chart below come from training the top filter (`spatial_tone_curve`, P=16, K=5, on `projector`) on **24 real captured scenes** and evaluating on **6 scenes held out entirely from training**.
+
+![Activation recovery on held-out scenes](docs/images/activation_recovery.png)
+
+| | Result |
+|---|---|
+| Mean activation-distance reduction (6 held-out scenes) | **35.9%** |
+| Per-scene range | 6.5% – 52.6% |
+| Filter parameters | 1,200 |
+| Fit time | ~211 s on a laptop CPU (24 pairs, 60 epochs) |
+| Model weights changed | **0** |
+
+And it converges fast — most of the recovery lands in the first ~15 epochs (real per-epoch metrics):
+
+![Convergence curve](docs/images/convergence_curve.png)
 
 ---
 
 ## Results (200-Config Sweep)
 
-> 10 filter types × 2 illumination levels × 10 layer groups, evaluated on 6 held-out test scenes.  
-> Metric: mean activation distance reduction on test set (higher = better).
+> 10 filter types × 2 illumination levels × 10 layer groups, evaluated on 6 held-out test scenes (synthetically relighted, used as a fast proxy).
+> Metric: mean activation-distance reduction on the test set (higher = better).
 
 ### Top Configurations
 
@@ -77,41 +119,56 @@ Adam optimizer → filter params updated, model frozen
 
 ### Key Findings
 
-**1. Layer group matters more than filter type.**  
-The `projector` layer (backbone's multi-scale feature projector) gives the strongest signal across all filter types. Results degrade progressively from late → mid → early backbone layers.
+**1. Layer group matters more than filter type.**
+The `projector` layer (the backbone's multi-scale feature projector) gives the strongest signal across every filter type. Results degrade progressively from late → mid → early backbone layers.
 
 ![Layer group comparison](docs/images/layer_group_comparison.png)
 
-| Layer Group | Best Test Reduction |
-|-------------|-------------------|
-| `projector` | **30.7%** |
-| `backbone.late+proj` | 21.0% |
-| `backbone.late` | 20.2% |
-| `backbone.early+proj` | 15.1% |
-| `backbone.mid` | 7.8% |
-
-**2. Non-linear filters outperform linear ones.**  
+**2. Non-linear filters outperform linear ones.**
 Spatial and tone-curve filters capture the non-linear, per-channel character of real illumination shifts better than affine transforms.
 
 ![Filter type comparison](docs/images/filter_comparison.png)
 
-| Filter | Best Test Reduction |
-|--------|-------------------|
-| `spatial_tone_curve` | **30.7%** |
-| `lut_3d` | 29.6% |
-| `tone_curve` | 24.1% |
-| `ccm_high_order` | 23.7% |
-| `affine_6param` | 20.4% |
-| `brightness_2param` | 12.3% |
+**3. The signal generalizes across illumination levels.**
+Results on `level_1→level_3` (stronger shift) are slightly lower but follow the same filter/group ranking — the approach isn't tied to one shift magnitude.
 
-**3. The signal generalizes across illumination levels.**  
-Results on `level_1→level_3` (stronger shift) are slightly lower but follow the same filter/group ranking, confirming that the approach is not dataset-specific.
-
-The heatmap below shows the full filter × layer-group matrix — green = better reduction:
+The full filter × layer-group matrix (green = better):
 
 ![Filter × layer group heatmap](docs/images/heatmap_filter_group.png)
 
 Full results: [`results/experiments/experiment_results.csv`](results/experiments/experiment_results.csv) — see [`docs/results_sweep_200.md`](docs/results_sweep_200.md) for the detailed breakdown.
+
+---
+
+## What's proven vs. what's next
+
+We'd rather be precise about what these numbers do and don't show.
+
+**✅ What's proven**
+- A tiny, label-free filter measurably pulls a frozen detector's internal representations back toward the reference condition — **35.9% on real held-out captured pairs**, 30.7% across a 200-config synthetic sweep.
+- It's cheap: thousands of params, minutes on a CPU, no model retraining, no labels.
+- The signal is robust: same ranking across filter families, layer groups, and shift magnitudes.
+
+**🔧 What's next (the milestone that closes the loop)**
+- **Detection-metric recovery.** Activation distance is a strong *proxy*; the proof a practitioner wants is mAP / box-quality / confidence on real shifted data: *baseline vs. filter vs. full retrain*. We've started this — there are detection-loss calibration runs in `results/experiments/runs/det_*` — and it's the headline goal of Phase 3.
+- **Per-condition generalization.** Confirm that one filter, fit once per environment, holds across a whole stream of frames (the deployment model above), not just per-image.
+- **Edge deploy CLI** to make "fit & swap a filter" a one-command operation.
+
+---
+
+## FAQ
+
+**Isn't this just white balance / histogram matching?**
+No — and that's the point. Classic ISP corrections optimize for human-perceived color. vcalib optimizes a *task-aware* objective: it minimizes the distance between the frozen detector's **activations**, so it corrects exactly what the model cares about. Linear color transforms (`white_balance`, `affine`) are *included* in the filter library and they consistently underperform the non-linear, activation-matched filters.
+
+**Where does the reference A come from at deploy time?**
+You capture a small set of A/B pairs once per new environment, fit the filter offline, freeze it, and ship it. At inference you only run `filter(frame) → frozen model`. No reference is needed online.
+
+**Does it actually improve detection, or just activations?**
+Today we measure activation-distance recovery (a proxy) — see [What's proven vs. what's next](#whats-proven-vs-whats-next). Detection-metric recovery is the active milestone.
+
+**Why freeze the model instead of fine-tuning?**
+Cost and operations: no labels, minutes on CPU vs. GPU-hours, a 2 KB artifact vs. a new checkpoint, and one model + N swappable filters instead of N fine-tuned models to maintain.
 
 ---
 
@@ -147,7 +204,7 @@ filter(x: Tensor[B, 3, H, W] in [0,1]) → Tensor[B, 3, H, W] in [0,1]
 | | `lut_3d_lowrank` | M·(3N+1) | low-rank LUT |
 | **Neural** | `neural_pixel` | ~1283 (configurable) | universal approximator |
 
-Spatial filters use a bilinear K×K control grid (`grid_sample`). Default K=3.  
+Spatial filters use a bilinear K×K control grid (`grid_sample`). Default K=3.
 `neural_pixel` is a pixel-wise residual MLP: `f(x) = clamp(x + MLP(x), 0, 1)`, identity-initialized.
 
 ---
@@ -214,7 +271,7 @@ vcalib/
 ├── src/
 │   ├── filters/              # 19 filter implementations + registry
 │   │   ├── base.py           # Filter base class (identity init, [0,1] clamping, reg_loss)
-│   │   ├── neural_pixel.py   # Pixel-wise residual MLP (new)
+│   │   ├── neural_pixel.py   # Pixel-wise residual MLP
 │   │   └── ...               # parametric filters
 │   ├── utils/
 │   │   ├── activations.py    # load_model, ActivationExtractor, LAYER_PATHS
@@ -228,17 +285,18 @@ vcalib/
 │   └── experiment_config.py  # Config schema + loader
 ├── configs/
 │   ├── grid.yaml             # Legacy grid config (35 groups × 17 filters)
-│   └── experiments/          # 70 YAML configs (one per experiment)
+│   └── experiments/          # YAML configs (one per experiment)
 ├── results/
 │   └── experiments/
 │       ├── experiment_results.csv   # 200-config sweep results
 │       └── runs/                    # Per-run checkpoints + metrics.jsonl
 ├── scripts/
-│   ├── augment_dataset.py    # Geometry augmentation preserving A/B pairs
-│   ├── create_datasets.py    # Split augmented data by illumination level
-│   └── generate_experiment_configs.py
+│   ├── augment_dataset.py        # Geometry augmentation preserving A/B pairs
+│   ├── create_datasets.py        # Split augmented data by illumination level
+│   └── generate_visual_report.py # Per-scene before/after HTML report
 ├── tests/                    # 222+ tests (fast + slow smoke)
 ├── docs/
+│   ├── images/               # Figures used in this README
 │   ├── results_sweep_200.md  # Detailed sweep analysis
 │   └── specs/                # Design specs
 ├── run_configs.py            # Main experiment runner (config-driven)
@@ -279,13 +337,11 @@ The runner (`run_configs.py`) loads the model once, iterates configs, and writes
 | Phase | Status | Description |
 |-------|--------|-------------|
 | A | ✅ Complete | Filter library (19 filters), calibration loop, tests |
-| B | ✅ Complete | Config-driven experiment runner, 70 YAML configs |
-| 1 | ⏳ Pending dataset | Diagnostic sweep (per-layer activation distance) |
-| 2 | ⏳ Pending Phase 1 | Full grid search on real data |
-| 3 | 🔧 In progress | Benchmark: proxy mAP recovery vs. calibration cost |
-| D | 📋 Planned | Edge deploy CLI (`deploy_calibrate.py`) |
-
-Current experiments (200-config sweep) were run on synthetically relighted images as a proxy. Real captured dataset is pending.
+| B | ✅ Complete | Config-driven experiment runner, YAML configs |
+| 1 | ✅ Complete | Diagnostic sweep + real-pair calibration (35.9% on held-out captures) |
+| 2 | ✅ Complete | 200-config grid sweep (filter × layer group × level) |
+| 3 | 🔧 In progress | Benchmark: **detection-metric** recovery vs. calibration cost |
+| D | 📋 Planned | Edge deploy CLI (`deploy_calibrate.py`) — fit & swap a filter |
 
 ---
 

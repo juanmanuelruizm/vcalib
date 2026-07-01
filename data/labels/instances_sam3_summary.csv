@@ -1,0 +1,91 @@
+file,n,prompts,scores
+IMG_1_I1,1,coffee maker,0.61
+IMG_1_I2,1,coffee maker,0.80
+IMG_1_I3,1,coffee maker,0.62
+IMG_2_I1,2,bag|coffee maker,"0.90,0.47"
+IMG_2_I2,2,bag|coffee maker,"0.81,0.76"
+IMG_2_I3,2,bag|coffee maker,"0.90,0.56"
+IMG_3_I1,1,bag,0.91
+IMG_3_I2,1,bag,0.87
+IMG_3_I3,1,bag,0.90
+IMG_4_I1,1,drinking glass,0.87
+IMG_4_I2,1,drinking glass,0.87
+IMG_4_I3,1,drinking glass,0.90
+IMG_5_I1,1,+box,0.93
+IMG_5_I2,1,+box,0.15
+IMG_5_I3,1,+box,0.10
+IMG_6_I1,1,glass,0.72
+IMG_6_I2,0,glass,-
+IMG_6_I3,1,glass,0.84
+IMG_7_I1,1,jar,0.88
+IMG_7_I2,1,jar,0.72
+IMG_7_I3,1,jar,0.74
+IMG_8_I1,2,can|bottle,"0.97,0.96"
+IMG_8_I2,2,can|bottle,"0.96,0.91"
+IMG_8_I3,2,can|bottle,"0.97,0.97"
+IMG_9_I1,1,can,0.97
+IMG_9_I2,1,can,0.45
+IMG_9_I3,1,can,0.97
+IMG_10_I1,1,jar,0.94
+IMG_10_I2,1,jar,0.89
+IMG_10_I3,1,jar,0.92
+IMG_11_I1,1,bottle,0.97
+IMG_11_I2,1,bottle,0.97
+IMG_11_I3,1,bottle,0.97
+IMG_12_I1,1,jar,0.92
+IMG_12_I2,1,jar,0.84
+IMG_12_I3,1,jar,0.84
+IMG_13_I1,1,bag,0.85
+IMG_13_I2,1,bag,0.81
+IMG_13_I3,1,bag,0.86
+IMG_14_I1,1,ball,0.94
+IMG_14_I2,1,ball,0.92
+IMG_14_I3,1,ball,0.93
+IMG_15_I1,1,vase,0.70
+IMG_15_I2,1,vase,0.76
+IMG_15_I3,1,vase,0.61
+IMG_16_I1,1,paper towel roll,0.97
+IMG_16_I2,1,paper towel roll,0.97
+IMG_16_I3,1,paper towel roll,0.97
+IMG_17_I1,1,bag,0.93
+IMG_17_I2,1,bag,0.85
+IMG_17_I3,1,bag,0.92
+IMG_18_I1,1,can,0.95
+IMG_18_I2,1,can,0.92
+IMG_18_I3,1,can,0.96
+IMG_19_I1,1,box,0.95
+IMG_19_I2,1,box,0.90
+IMG_19_I3,1,box,0.95
+IMG_20_I1,1,shoe,0.98
+IMG_20_I2,1,shoe,0.97
+IMG_20_I3,1,shoe,0.98
+IMG_21_I1,1,notebook,0.88
+IMG_21_I2,1,notebook,0.88
+IMG_21_I3,1,notebook,0.89
+IMG_22_I1,1,remote control,0.95
+IMG_22_I2,1,remote control,0.96
+IMG_22_I3,1,remote control,0.97
+IMG_23_I1,1,+box,0.97
+IMG_23_I2,1,+box,0.98
+IMG_23_I3,1,+box,0.97
+IMG_24_I1,1,headphones,0.97
+IMG_24_I2,1,headphones,0.97
+IMG_24_I3,1,headphones,0.97
+IMG_25_I1,1,case,0.54
+IMG_25_I2,1,case,0.46
+IMG_25_I3,1,case,0.59
+IMG_26_I1,3,spray bottle|coffee maker|bag,"0.92,0.86,0.34"
+IMG_26_I2,3,spray bottle|coffee maker|bag,"0.91,0.80,0.80"
+IMG_26_I3,3,spray bottle|coffee maker|bag,"0.93,0.86,0.35"
+IMG_27_I1,2,bottle|jar,"0.95,0.85"
+IMG_27_I2,2,bottle|jar,"0.94,0.57"
+IMG_27_I3,2,bottle|jar,"0.95,0.88"
+IMG_28_I1,3,bottle|jar,"0.97,0.96,0.89"
+IMG_28_I2,3,bottle|jar,"0.95,0.91,0.69"
+IMG_28_I3,3,bottle|jar,"0.97,0.96,0.86"
+IMG_29_I1,2,book,"0.82,0.81"
+IMG_29_I2,1,book,0.92
+IMG_29_I3,2,book,"0.84,0.83"
+IMG_30_I1,1,book,0.88
+IMG_30_I2,1,book,0.80
+IMG_30_I3,1,book,0.84

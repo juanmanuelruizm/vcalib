@@ -24,7 +24,7 @@ In deployment this becomes **one frozen model + a swappable library of tiny filt
 
 ![Deployment model](docs/images/deployment_model.png)
 
-> **Why we're excited:** if this holds at the *detection-metric* level (our next milestone — see [What's proven vs. what's next](#whats-proven-vs-whats-next)), then keeping a model healthy in the field stops being a retraining problem and becomes a *calibration* problem — orders of magnitude cheaper, no labels, runs on the edge.
+> **Why we're excited:** this now holds at the *detection-metric* level too — scored as real mAP against *independent* (SAM3) pseudo-ground-truth, a detection-calibrated filter recovers **~60% of the AP gap** on held-out scenes (see [Does it recover detection?](#does-it-recover-detection-not-just-activations)). The filter itself is still **label-free**; labels enter only to *measure* mAP. Keeping a model healthy in the field starts to look less like a retraining problem and more like a *calibration* problem — orders of magnitude cheaper, and it runs on the edge.
 
 ---
 
@@ -112,7 +112,24 @@ And there's a clean, honest lesson in the data: **what you optimize is what you 
 
 ![What you optimize is what you recover](docs/images/objective_comparison.png)
 
-> This is detection-*output* agreement against a self-supervised reference — strong evidence that the effect reaches the detection head, but not yet a mAP number against human-annotated ground truth. That last step is what closes the loop (see below).
+> This is detection-*output* agreement against a self-supervised reference — strong evidence that the effect reaches the detection head. To turn it into an actual mAP number, we bring in an *independent* label source below.
+
+### Now measured as real mAP (against independent pseudo-GT)
+
+Scoring the detector against its own reference-condition predictions is convenient but circular. To break that, we label the captured objects with **SAM3** — a segmentation model *independent of RF-DETR* — and treat those boxes as pseudo-ground-truth. We then run frozen RF-DETR on the reference **A**, the shifted **B**, and `filter(B)`, and compute **class-agnostic COCO box AP** against the SAM3 GT (the objects are largely outside the COCO label space, so we score localization, not class).
+
+On the 6 held-out real scenes (`level_1 → level_2`):
+
+| arm | AP@[.5:.95] | AP50 |
+|---|---|---|
+| A — reference | 0.569 | 0.737 |
+| B — shifted | 0.368 | 0.492 |
+| `filter(B)` — activation-trained | 0.374 | 0.550 |
+| **`filter(B)` — detection-trained** | **0.492** | **0.772** |
+
+The detection-trained filter closes **61.9% of the A→B AP gap** and **fully recovers AP50** (`filter(B)` even edges past A), while the activation-trained filter recovers only ~3% of AP — the same *what you optimize is what you recover* lesson, now at the mAP level.
+
+**Honest caveats.** (1) This is **SAM3 pseudo-GT, not human annotation** — an independent model, but still a model. (2) Recovery is cleanest at level 2; under the stronger `level_3` shift the filter still strongly recovers **AP50** (whether the object is found) but trades some high-IoU box precision, so strict AP is mixed. (3) 16 of the 90 raw frames are truncated to 256 KB (incl. one test scene), which slightly depresses the absolute numbers. Reproduce with [`scripts/autolabel_sam3.py`](scripts/autolabel_sam3.py) (labels) → [`scripts/benchmark_detection.py`](scripts/benchmark_detection.py) (mAP).
 
 ---
 
@@ -163,11 +180,12 @@ We'd rather be precise about what these numbers do and don't show.
 **✅ What's proven**
 - A tiny, label-free filter measurably pulls a frozen detector's internal representations back toward the reference condition — **35.9% on real held-out captured pairs**, 30.7% across a 200-config synthetic sweep.
 - The effect reaches the **detection head**: calibrating against the detection objective recovers **20.4%** of the detection-output drift on held-out real pairs (every scene improves), measured label-free against the model's own reference-condition detections.
-- It's cheap: thousands of params, minutes on a CPU, no model retraining, no labels.
+- At the **mAP level**: scored against *independent* SAM3 pseudo-GT, a detection-calibrated filter recovers **61.9% of the class-agnostic AP gap** and fully recovers AP50 on held-out `level_2` pairs — vs ~3% of AP for the activation-trained filter.
+- It's cheap: thousands of params, minutes on a CPU, no model retraining, no labels (the filter is label-free; labels enter only to *score* mAP).
 - The signal is robust: same ranking across filter families, layer groups, and shift magnitudes — and *what you optimize is what you recover*.
 
 **🔧 What's next (the milestone that closes the loop)**
-- **mAP against human ground truth.** We've shown detection-*output* recovery against a self-supervised reference; the final proof is mAP / box-quality on **hand-annotated** shifted data, with a **full-retrain arm** as the upper-bound comparison.
+- **mAP against human ground truth + a full-retrain upper bound.** We now have mAP against *independent pseudo-GT* (SAM3); the remaining proof is mAP / box-quality on **hand-annotated** shifted data, with a **full-retrain arm** as the upper-bound comparison — plus tightening high-IoU recovery under the stronger `level_3` shift.
 - **Per-condition generalization.** Confirm that one filter, fit once per environment, holds across a whole stream of frames (the deployment model above), not just per-image.
 - **Edge deploy CLI** to make "fit & swap a filter" a one-command operation.
 
@@ -182,7 +200,7 @@ No — and that's the point. Classic ISP corrections optimize for human-perceive
 You capture a small set of A/B pairs once per new environment, fit the filter offline, freeze it, and ship it. At inference you only run `filter(frame) → frozen model`. No reference is needed online.
 
 **Does it actually improve detection, or just activations?**
-Both. Beyond the 35.9% activation recovery, a detection-calibrated filter recovers **20.4%** of the drift in the model's *detection outputs* (class logits + boxes) on held-out real pairs — see [Does it recover detection?](#does-it-recover-detection-not-just-activations). The remaining step is mAP against human-annotated ground truth.
+Both. Beyond the 35.9% activation recovery, a detection-calibrated filter recovers **20.4%** of the drift in the model's *detection outputs*, and — scored as real mAP against independent SAM3 pseudo-GT — closes **61.9% of the class-agnostic AP gap** on held-out `level_2` pairs (see [Does it recover detection?](#does-it-recover-detection-not-just-activations)). The remaining step is mAP against *human* ground truth with a full-retrain upper bound.
 
 **Why freeze the model instead of fine-tuning?**
 Cost and operations: no labels, minutes on CPU vs. GPU-hours, a 2 KB artifact vs. a new checkpoint, and one model + N swappable filters instead of N fine-tuned models to maintain.
@@ -298,7 +316,7 @@ vcalib/
 │   ├── calibration.py        # Adam calibration loop, group_loss, overfit gate
 │   ├── diagnostics.py        # Phase 1: per-layer distance sweep
 │   ├── grid_search.py        # Phase 2: grid executor (legacy)
-│   ├── benchmark.py          # Phase 3: proxy mAP recovery (WIP)
+│   ├── benchmark.py          # Phase 3 stub → see scripts/benchmark_detection.py
 │   └── experiment_config.py  # Config schema + loader
 ├── configs/
 │   ├── grid.yaml             # Legacy grid config (35 groups × 17 filters)
@@ -308,8 +326,11 @@ vcalib/
 │       ├── experiment_results.csv   # 200-config sweep results
 │       └── runs/                    # Per-run checkpoints + metrics.jsonl
 ├── scripts/
+│   ├── organize_raw_scenes.py    # Stage 1: flat raw captures → scene folders
 │   ├── augment_dataset.py        # Geometry augmentation preserving A/B pairs
 │   ├── create_datasets.py        # Split augmented data by illumination level
+│   ├── autolabel_sam3.py         # SAM3 auto-labeling → COCO GT (bbox + masks)
+│   ├── benchmark_detection.py    # Phase 3: real mAP recovery vs SAM3 pseudo-GT
 │   └── generate_visual_report.py # Per-scene before/after HTML report
 ├── tests/                    # 222+ tests (fast + slow smoke)
 ├── docs/
@@ -357,7 +378,7 @@ The runner (`run_configs.py`) loads the model once, iterates configs, and writes
 | B | ✅ Complete | Config-driven experiment runner, YAML configs |
 | 1 | ✅ Complete | Diagnostic sweep + real-pair calibration (35.9% on held-out captures) |
 | 2 | ✅ Complete | 200-config grid sweep (filter × layer group × level) |
-| 3 | 🔧 In progress | Detection recovery: 20.4% on detection outputs (held-out); mAP vs. human GT next |
+| 3 | 🔧 In progress | Detection recovery: 20.4% on detection outputs **+ 61.9% of the AP gap vs. SAM3 pseudo-GT** (held-out); human GT + full-retrain upper bound next |
 | D | 📋 Planned | Edge deploy CLI (`deploy_calibrate.py`) — fit & swap a filter |
 
 ---

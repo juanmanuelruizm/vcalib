@@ -1,0 +1,4 @@
+arm,AP,AP50,AP75,AR100,level,scenes,checkpoint
+A,0.5690,0.7370,0.6321,0.9000,2,test,results/experiments/runs/det_stc_detection_lv2/best.pt
+B,0.3677,0.4918,0.4003,0.9000,2,test,results/experiments/runs/det_stc_detection_lv2/best.pt
+filterB,0.4922,0.7721,0.4453,0.9143,2,test,results/experiments/runs/det_stc_detection_lv2/best.pt

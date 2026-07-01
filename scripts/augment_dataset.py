@@ -44,7 +44,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # some raw captures are truncated to 256KB
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.utils.data_pairs import ImagePair, discover_pairs

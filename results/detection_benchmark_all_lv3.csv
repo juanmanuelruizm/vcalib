@@ -1,0 +1,4 @@
+arm,AP,AP50,AP75,AR100,level,scenes,checkpoint
+A,0.5803,0.7091,0.6262,0.9105,3,all,results/experiments/runs/real_stc_P16_g5_lv2/best.pt
+B,0.5023,0.5713,0.5560,0.9237,3,all,results/experiments/runs/real_stc_P16_g5_lv2/best.pt
+filterB,0.5024,0.5663,0.5325,0.9263,3,all,results/experiments/runs/real_stc_P16_g5_lv2/best.pt

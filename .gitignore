@@ -44,6 +44,8 @@ data/raw
 data/processed/
 data/augmented/
 data/datasets/
+data/scenes/
+data/labels/qa/
 results/**/*.pt
 results/*.log
 *.csv

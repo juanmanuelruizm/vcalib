@@ -1,0 +1,42 @@
+# Scene -> concept prompts for SAM3 auto-labeling of data/raw frames.
+# One entry per capture scene (IMG_<n>); the 3 illumination levels (I1/I2/I3)
+# share the same object(s), so they reuse the scene's prompt list.
+# Multi-object scenes list every foreground item on the cooktop.
+# Prompts are open-vocabulary noun phrases fed to SAM3 concept segmentation.
+
+default_prompts: [object]      # fallback if a scene is missing below
+threshold: 0.30                # min instance score to keep (global default)
+
+scenes:
+  IMG_1:  [coffee maker]
+  IMG_2:  [bag, coffee maker]
+  IMG_3:  [bag]
+  IMG_4:  [drinking glass]
+  # thin pale stick lying flat: no text prompt fires -> box exemplar
+  IMG_5:  {boxes: [[600, 710, 1015, 790]]}
+  IMG_6:  [glass]
+  IMG_7:  [jar]
+  IMG_8:  [can, bottle]
+  IMG_9:  [can]
+  IMG_10: [jar]
+  IMG_11: [bottle]
+  IMG_12: [jar]
+  IMG_13: [bag]
+  IMG_14: [ball]
+  IMG_15: [vase]
+  IMG_16: [paper towel roll]
+  IMG_17: [bag]
+  IMG_18: [can]
+  IMG_19: [box]
+  IMG_20: [shoe]
+  IMG_21: [notebook]
+  IMG_22: [remote control]
+  # dark tablet in a folio case: text prompts unreliable -> box exemplar
+  IMG_23: {boxes: [[355, 20, 945, 945]]}
+  IMG_24: [headphones]
+  IMG_25: [case]
+  IMG_26: [spray bottle, coffee maker, bag]
+  IMG_27: [bottle, jar]
+  IMG_28: [bottle, jar]
+  IMG_29: [book]
+  IMG_30: [book]

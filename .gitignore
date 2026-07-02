@@ -46,6 +46,8 @@ data/augmented/
 data/datasets/
 data/scenes/
 data/labels/qa/
+data/coco/
+results/finetune/
 results/**/*.pt
 results/*.log
 *.csv

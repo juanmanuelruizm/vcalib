@@ -24,7 +24,7 @@ In deployment this becomes **one frozen model + a swappable library of tiny filt
 
 ![Deployment model](docs/images/deployment_model.png)
 
-> **Why we're excited:** this now holds at the *detection-metric* level too — scored as real mAP against *independent* (SAM3) pseudo-ground-truth, a detection-calibrated filter recovers **~60% of the AP gap** on held-out scenes (see [Does it recover detection?](#does-it-recover-detection-not-just-activations)). The filter itself is still **label-free**; labels enter only to *measure* mAP. Keeping a model healthy in the field starts to look less like a retraining problem and more like a *calibration* problem — orders of magnitude cheaper, and it runs on the edge.
+> **Why we're excited:** this now holds at the *detection-metric* level too — scored as real mAP against *independent* (SAM3) pseudo-ground-truth, a detection-calibrated filter **fully closes the AP gap** on held-out `level_2` scenes — the corrected frame even scores *above* the reference (see [Does it recover detection?](#does-it-recover-detection-not-just-activations)). The filter itself is still **label-free**; labels enter only to *measure* mAP. Keeping a model healthy in the field starts to look less like a retraining problem and more like a *calibration* problem — orders of magnitude cheaper, and it runs on the edge.
 
 ---
 
@@ -122,14 +122,14 @@ On the 6 held-out real scenes (`level_1 → level_2`):
 
 | arm | AP@[.5:.95] | AP50 |
 |---|---|---|
-| A — reference | 0.569 | 0.737 |
-| B — shifted | 0.368 | 0.492 |
-| `filter(B)` — activation-trained | 0.374 | 0.550 |
-| **`filter(B)` — detection-trained** | **0.492** | **0.772** |
+| A — reference | 0.544 | 0.703 |
+| B — shifted | 0.377 | 0.497 |
+| `filter(B)` — activation-trained | 0.379 | 0.551 |
+| **`filter(B)` — detection-trained** | **0.580** | **0.841** |
 
-The detection-trained filter closes **61.9% of the A→B AP gap** and **fully recovers AP50** (`filter(B)` even edges past A), while the activation-trained filter recovers only ~3% of AP — the same *what you optimize is what you recover* lesson, now at the mAP level.
+The detection-trained filter closes the **entire A→B AP gap (121.5%)** — on these 6 held-out scenes `filter(B)` scores *above* the reference A on AP, AP50 **and** AP75 (0.614→0.619) — while the activation-trained filter recovers only ~1% of AP: the same *what you optimize is what you recover* lesson, now at the mAP level.
 
-**Honest caveats.** (1) This is **SAM3 pseudo-GT, not human annotation** — an independent model, but still a model. (2) Recovery is cleanest at level 2; under the stronger `level_3` shift the filter still strongly recovers **AP50** (whether the object is found) but trades some high-IoU box precision, so strict AP is mixed. (3) 16 of the 90 raw frames are truncated to 256 KB (incl. one test scene), which slightly depresses the absolute numbers. Reproduce with [`scripts/autolabel_sam3.py`](scripts/autolabel_sam3.py) (labels) → [`scripts/benchmark_detection.py`](scripts/benchmark_detection.py) (mAP).
+**Honest caveats.** (1) This is **SAM3 pseudo-GT, not human annotation** — an independent model, but still a model. (2) These are only **6 held-out test scenes**, so a few boxes move the numbers; the corrected filter edging past A is real on this set but not a large-sample claim. (3) Recovery is cleanest at level 2; under the stronger `level_3` shift the filter still recovers **AP50** past the reference (0.756 vs 0.569 shifted, 0.703 reference) but trades high-IoU box precision, so strict AP goes flat-to-negative. Reproduce with [`scripts/autolabel_sam3.py`](scripts/autolabel_sam3.py) (labels) → [`scripts/benchmark_detection.py`](scripts/benchmark_detection.py) (mAP).
 
 ---
 
@@ -180,7 +180,7 @@ We'd rather be precise about what these numbers do and don't show.
 **✅ What's proven**
 - A tiny, label-free filter measurably pulls a frozen detector's internal representations back toward the reference condition — **35.9% on real held-out captured pairs**, 30.7% across a 200-config synthetic sweep.
 - The effect reaches the **detection head**: calibrating against the detection objective recovers **20.4%** of the detection-output drift on held-out real pairs (every scene improves), measured label-free against the model's own reference-condition detections.
-- At the **mAP level**: scored against *independent* SAM3 pseudo-GT, a detection-calibrated filter recovers **61.9% of the class-agnostic AP gap** and fully recovers AP50 on held-out `level_2` pairs — vs ~3% of AP for the activation-trained filter.
+- At the **mAP level**: scored against *independent* SAM3 pseudo-GT, a detection-calibrated filter closes the **full class-agnostic AP gap (121.5%)** — `filter(B)` scores above the reference A on AP, AP50 and AP75 — on held-out `level_2` pairs, vs ~1% of AP for the activation-trained filter.
 - It's cheap: thousands of params, minutes on a CPU, no model retraining, no labels (the filter is label-free; labels enter only to *score* mAP).
 - The signal is robust: same ranking across filter families, layer groups, and shift magnitudes — and *what you optimize is what you recover*.
 
@@ -200,7 +200,7 @@ No — and that's the point. Classic ISP corrections optimize for human-perceive
 You capture a small set of A/B pairs once per new environment, fit the filter offline, freeze it, and ship it. At inference you only run `filter(frame) → frozen model`. No reference is needed online.
 
 **Does it actually improve detection, or just activations?**
-Both. Beyond the 35.9% activation recovery, a detection-calibrated filter recovers **20.4%** of the drift in the model's *detection outputs*, and — scored as real mAP against independent SAM3 pseudo-GT — closes **61.9% of the class-agnostic AP gap** on held-out `level_2` pairs (see [Does it recover detection?](#does-it-recover-detection-not-just-activations)). The remaining step is mAP against *human* ground truth with a full-retrain upper bound.
+Both. Beyond the 35.9% activation recovery, a detection-calibrated filter recovers **20.4%** of the drift in the model's *detection outputs*, and — scored as real mAP against independent SAM3 pseudo-GT — closes the **full class-agnostic AP gap (121.5%, `filter(B)` exceeds the reference)** on held-out `level_2` pairs (see [Does it recover detection?](#does-it-recover-detection-not-just-activations)). The remaining step is mAP against *human* ground truth with a full-retrain upper bound.
 
 **Why freeze the model instead of fine-tuning?**
 Cost and operations: no labels, minutes on CPU vs. GPU-hours, a 2 KB artifact vs. a new checkpoint, and one model + N swappable filters instead of N fine-tuned models to maintain.
@@ -378,7 +378,7 @@ The runner (`run_configs.py`) loads the model once, iterates configs, and writes
 | B | ✅ Complete | Config-driven experiment runner, YAML configs |
 | 1 | ✅ Complete | Diagnostic sweep + real-pair calibration (35.9% on held-out captures) |
 | 2 | ✅ Complete | 200-config grid sweep (filter × layer group × level) |
-| 3 | 🔧 In progress | Detection recovery: 20.4% on detection outputs **+ 61.9% of the AP gap vs. SAM3 pseudo-GT** (held-out); human GT + full-retrain upper bound next |
+| 3 | 🔧 In progress | Detection recovery: 20.4% on detection outputs **+ full AP gap (121.5%) vs. SAM3 pseudo-GT** (held-out `level_2`); human GT + full-retrain upper bound next |
 | D | 📋 Planned | Edge deploy CLI (`deploy_calibrate.py`) — fit & swap a filter |
 
 ---

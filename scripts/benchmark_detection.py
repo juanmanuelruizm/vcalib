@@ -99,6 +99,8 @@ def main():
     ap.add_argument("--max-det", type=int, default=100)
     ap.add_argument("--input-size", type=int, default=384)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--model-checkpoint", default=None,
+                    help="fine-tuned RF-DETR checkpoint (weights/best.pt); default = off-the-shelf nano")
     ap.add_argument("--out", default="results/detection_benchmark.csv")
     args = ap.parse_args()
 
@@ -119,7 +121,7 @@ def main():
         scenes = [int(s) for s in args.scenes.split(",")]
 
     raw = Path(args.gt).parent.parent / "raw"
-    libre = load_model(size="n", device=args.device)
+    libre = load_model(size="n", device=args.device, model_path=args.model_checkpoint)
     filt = build_filter(spec).to(args.device).eval()
     filt.load_state_dict(torch.load(args.checkpoint, map_location=args.device, weights_only=False))
     print(f"filter {spec} <- {args.checkpoint}")

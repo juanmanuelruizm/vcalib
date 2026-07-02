@@ -54,6 +54,7 @@ def load_model(
     size: str = "n",
     device: Optional[str] = None,
     weights_dir: Optional[Union[str, Path]] = None,
+    model_path: Optional[Union[str, Path]] = None,
 ) -> Any:
     """Load a frozen RF-DETR model via LibreYOLO.
 
@@ -63,31 +64,39 @@ def load_model(
         weights_dir: Directory holding `<size>` weights. Defaults to the
             submodule's ``weights/`` dir; ``rf-detr-nano.pth`` is auto-downloaded
             there on first use.
+        model_path: Explicit checkpoint to load (e.g. a fine-tuned
+            ``weights/best.pt``). Overrides ``weights_dir``/``size`` weight lookup;
+            used to evaluate/calibrate against a domain-adapted detector.
 
     Returns:
-        The ``LibreRFDETR`` wrapper (cached per size/device/weights_dir).
+        The ``LibreRFDETR`` wrapper (cached per size/device/weights).
     """
     from libreyolo import LibreRFDETR
 
     if size not in INPUT_SIZES:
         raise ValueError(f"Unknown size {size!r}; expected one of {list(INPUT_SIZES)}")
 
-    wdir = Path(weights_dir).resolve() if weights_dir else DEFAULT_WEIGHTS_DIR.resolve()
-    wdir.mkdir(parents=True, exist_ok=True)
-    pretrain = {
-        "n": "rf-detr-nano.pth",
-        "s": "rf-detr-small.pth",
-        "m": "rf-detr-medium.pth",
-        "l": "rf-detr-large.pth",
-    }[size]
-    model_path = wdir / pretrain
+    if model_path is not None:
+        ckpt = Path(model_path).resolve()
+        if not ckpt.exists():
+            raise FileNotFoundError(f"model_path does not exist: {ckpt}")
+    else:
+        wdir = Path(weights_dir).resolve() if weights_dir else DEFAULT_WEIGHTS_DIR.resolve()
+        wdir.mkdir(parents=True, exist_ok=True)
+        pretrain = {
+            "n": "rf-detr-nano.pth",
+            "s": "rf-detr-small.pth",
+            "m": "rf-detr-medium.pth",
+            "l": "rf-detr-large.pth",
+        }[size]
+        ckpt = wdir / pretrain
 
     dev = _resolve_device(device)
-    cache_key = (size, str(dev), str(wdir))
+    cache_key = (size, str(dev), str(ckpt))
     if cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
 
-    libre = LibreRFDETR(model_path=str(model_path), size=size, device=str(dev))
+    libre = LibreRFDETR(model_path=str(ckpt), size=size, device=str(dev))
     libre.model.eval()
     for p in libre.model.parameters():
         p.requires_grad_(False)

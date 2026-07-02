@@ -47,7 +47,10 @@ data/datasets/
 data/scenes/
 data/labels/qa/
 data/coco/
+data/exdark_raw/
 results/finetune/
+results/ft_bench/
+runs/
 results/**/*.pt
 results/*.log
 *.csv

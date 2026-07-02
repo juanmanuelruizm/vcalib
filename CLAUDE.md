@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Active experiment — branch `finetune-rfdetr-ref`:** fine-tune RF-DETR on the reference
+> condition + train a **pair-free, GT-supervised** filter (no reference-A needed), validated on
+> cooktop + ExDark. Full runbook and **fresh-clone prerequisites** (submodule init, copy the
+> gitignored `data/raw/`) in [`docs/finetune-rfdetr-ref.md`](docs/finetune-rfdetr-ref.md).
+> Run with `./scripts/run_finetune_matrix.sh cuda`. Read that runbook before starting work on
+> this branch — Claude's per-machine memory does not travel across machines.
+
 ## What This Project Is
 
 A research framework for training a **learnable differentiable preprocessing filter** that corrects illumination shifts in RF-DETR (nano) object detection — recovering detection performance without retraining the model. The filter is a pixel-space transformation applied before ImageNet normalization; the model stays frozen throughout.

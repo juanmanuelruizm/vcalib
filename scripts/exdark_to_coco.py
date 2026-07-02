@@ -17,10 +17,10 @@ Lighting index (ExDark): 1 Low 2 Ambient 3 Object 4 Single 5 Weak 6 Strong
 7 Screen 8 Window 9 Shadow 10 Twilight.
 
 Emits (single-class 'object' by default, or 12 classes with --multiclass):
-  annotations/instances_bright.json                 reference fine-tune set
+  annotations/instances_bright_{train,val}.json     reference fine-tune set (per-class split)
   annotations/instances_dark_{train,val,test}.json  shift set (official split flag)
   images/<split>/...                                relative symlinks
-  data_dark.yaml                                    for the dark (shift) filter/eval
+  data_bright.yaml / data_dark.yaml                 fine-tune A' / filter+eval
 
 NOTE: untested until ExDark is downloaded; validate on the GPU box.
 
@@ -32,6 +32,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
+from collections import defaultdict
 from pathlib import Path
 
 CLASSES = ["Bicycle", "Boat", "Bottle", "Bus", "Car", "Cat", "Chair", "Cup",
@@ -117,6 +119,10 @@ def main() -> None:
                     help="comma list of lighting conditions treated as reference/bright")
     ap.add_argument("--multiclass", action="store_true",
                     help="keep the 12 classes (default: collapse to single 'object')")
+    ap.add_argument("--bright-val-frac", type=float, default=0.15,
+                    help="fraction of the bright (reference) set held out per class "
+                         "for fine-tune early-stopping")
+    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
     root, out = Path(args.exdark_root), Path(args.out)
@@ -133,8 +139,12 @@ def main() -> None:
         cat_id = {c: 1 for c in CLASSES}
         categories = [{"id": 1, "name": "object"}]
 
-    # group images -> which output split (bright / dark_{train,val,test})
-    groups = {"bright": [], "dark_train": [], "dark_val": [], "dark_test": []}
+    # group images -> output split. The bright (reference) set is split per-class
+    # into train/val for the reference fine-tune; the dark (shift) set uses
+    # ExDark's official train/val/test flag from imageclasslist.txt.
+    groups = {"bright_train": [], "bright_val": [],
+              "dark_train": [], "dark_val": [], "dark_test": []}
+    bright_items = []
     for cls in CLASSES:
         for img_path in sorted((images_root / cls).glob("*")):
             if img_path.name.startswith("._"):
@@ -148,10 +158,21 @@ def main() -> None:
             if not gt.exists():
                 continue
             if m["lighting"] in bright:
-                key = "bright"
+                bright_items.append((cls, img_path, gt))
             else:
                 key = {1: "dark_train", 2: "dark_val", 3: "dark_test"}[m["split"]]
-            groups[key].append((cls, img_path, gt))
+                groups[key].append((cls, img_path, gt))
+
+    # deterministic per-class train/val split of the bright reference set
+    rng = random.Random(args.seed)
+    by_cls = defaultdict(list)
+    for item in bright_items:
+        by_cls[item[0]].append(item)
+    for items in by_cls.values():
+        rng.shuffle(items)
+        n_val = round(len(items) * args.bright_val_frac) if len(items) > 1 else 0
+        groups["bright_val"].extend(items[:n_val])
+        groups["bright_train"].extend(items[n_val:])
 
     (out / "annotations").mkdir(parents=True, exist_ok=True)
     for key, items in groups.items():
@@ -180,19 +201,29 @@ def main() -> None:
         print(f"  {key:11}: {len(images):4} imgs, {len(anns):4} anns")
 
     nc = len(categories)
-    (out / "data_dark.yaml").write_text(
-        f"path: {out.resolve()}\n"
-        "train: images/dark_train\n"
-        "val: images/dark_val\n"
-        "test: images/dark_test\n"
-        "annotations:\n"
-        "  train: annotations/instances_dark_train.json\n"
-        "  val: annotations/instances_dark_val.json\n"
-        "  test: annotations/instances_dark_test.json\n"
-        f"names:\n" + "".join(f"  {i}: {c['name']}\n" for i, c in enumerate(categories)) +
-        f"nc: {nc}\n"
-    )
+    names_block = ("names:\n"
+                   + "".join(f"  {i}: {c['name']}\n" for i, c in enumerate(categories))
+                   + f"nc: {nc}\n")
+
+    def _yaml(prefix: str) -> str:
+        # bright has no separate test split -> point test at its val.
+        test = "dark_test" if prefix == "dark" else "bright_val"
+        return (
+            f"path: {out.resolve()}\n"
+            f"train: images/{prefix}_train\n"
+            f"val: images/{prefix}_val\n"
+            f"test: images/{test}\n"
+            "annotations:\n"
+            f"  train: annotations/instances_{prefix}_train.json\n"
+            f"  val: annotations/instances_{prefix}_val.json\n"
+            f"  test: annotations/instances_{test}.json\n"
+            + names_block
+        )
+
+    (out / "data_bright.yaml").write_text(_yaml("bright"))
+    (out / "data_dark.yaml").write_text(_yaml("dark"))
     print(f"bright(reference)={sorted(bright)} | multiclass={args.multiclass} -> {out}")
+    print("  wrote data_bright.yaml (fine-tune A') + data_dark.yaml (filter/eval)")
 
 
 if __name__ == "__main__":

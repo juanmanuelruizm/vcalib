@@ -18,6 +18,11 @@ Usage:
       --data data/coco/cooktop_shift_lv2 \
       --model-checkpoint results/finetune/cooktop_ref_headonly/weights/best.pt \
       --out results/experiments/runs/pairfree_stc_lv2
+
+  # ExDark (unpaired) off-the-shelf baseline arm -> remap labels to COCO-91:
+  uv run python scripts/train_filter_detloss.py --data data/coco/exdark \
+      --train-split dark_train --val-split dark_val --label-map exdark_coco \
+      --out results/experiments/runs/exdark_pairfree_offtheshelf
 """
 from __future__ import annotations
 
@@ -40,6 +45,15 @@ from src.utils.activations import load_model, to_unit_rgb, normalize
 from src.calibration import _make_nested_tensor
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# ExDark contiguous class (by name) -> RF-DETR raw logit column (COCO 91-id space).
+# Only for the off-the-shelf baseline arm, whose criterion is 91-class; the
+# fine-tuned A' head is native 12-class, so it needs no remap. Derived from
+# libreyolo's _COCO91_TO_COCO80 + the model's COCO-80 names (verified).
+EXDARK_TO_COCO91 = {
+    "Bicycle": 2, "Boat": 9, "Bottle": 44, "Bus": 6, "Car": 3, "Cat": 17,
+    "Chair": 62, "Cup": 47, "Dog": 18, "Motorbike": 4, "People": 1, "Table": 67,
+}
 
 
 def load_split(data_dir: Path, split: str):
@@ -65,8 +79,8 @@ def load_split(data_dir: Path, split: str):
     return items
 
 
-def det_loss(model, crit, filt, raw, file_name, boxes, labels, size, dev):
-    unit = to_unit_rgb(raw / file_name, size).to(dev)
+def det_loss(model, crit, filt, img_dir, file_name, boxes, labels, size, dev):
+    unit = to_unit_rgb(img_dir / file_name, size).to(dev)
     fb = filt(unit.unsqueeze(0)).clamp(0, 1)
     normed = normalize(fb[0]).unsqueeze(0)
     outputs = model.model(_make_nested_tensor(normed))
@@ -78,7 +92,12 @@ def det_loss(model, crit, filt, raw, file_name, boxes, labels, size, dev):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="COCO dataset dir from make_detection_coco.py")
+    ap.add_argument("--data", required=True, help="COCO dataset dir (make_detection_coco.py / exdark_to_coco.py)")
+    ap.add_argument("--train-split", default="train", help="training split name (e.g. dark_train for ExDark)")
+    ap.add_argument("--val-split", default="val", help="validation split name (e.g. dark_val for ExDark)")
+    ap.add_argument("--label-map", choices=["none", "exdark_coco"], default="none",
+                    help="'exdark_coco' remaps ExDark labels to RF-DETR's COCO-91 logit columns "
+                         "(off-the-shelf baseline arm); 'none' keeps native dataset labels (A')")
     ap.add_argument("--model-checkpoint", default=None, help="fine-tuned detector; default off-the-shelf")
     ap.add_argument("--filter-type", default="spatial_tone_curve")
     ap.add_argument("--P", type=int, default=16)
@@ -97,7 +116,8 @@ def main() -> None:
     random.seed(args.seed)
     dev = args.device
     data_dir = Path(args.data)
-    raw = Path("data/raw")
+    train_dir = data_dir / "images" / args.train_split
+    val_dir = data_dir / "images" / args.val_split
 
     model = load_model(size="n", device=dev, model_path=args.model_checkpoint)
     crit = model.model.build_criterion_and_postprocess()[0]
@@ -107,10 +127,21 @@ def main() -> None:
     filt = build_filter(spec).to(dev).train()
     opt = torch.optim.Adam(filt.parameters(), lr=args.lr)
 
-    train = load_split(data_dir, "train")
-    val = load_split(data_dir, "val")
+    train = load_split(data_dir, args.train_split)
+    val = load_split(data_dir, args.val_split)
+
+    # optional label remap: the off-the-shelf baseline arm needs ExDark labels in
+    # RF-DETR's COCO-91 logit space (A' is native 12-class -> remap stays None).
+    remap = None
+    if args.label_map == "exdark_coco":
+        cats = sorted(
+            json.load(open(data_dir / "annotations" / f"instances_{args.train_split}.json"))["categories"],
+            key=lambda c: c["id"])
+        remap = torch.tensor([EXDARK_TO_COCO91[c["name"]] for c in cats], dtype=torch.long)
+        print(f"label-map exdark_coco: contiguous->COCO91 = {remap.tolist()}")
+
     print(f"filter {spec} | model={'off-the-shelf' if not args.model_checkpoint else args.model_checkpoint}")
-    print(f"train={len(train)} val={len(val)} | detector-GT loss (pair-free)")
+    print(f"train={len(train)} val={len(val)} | splits={args.train_split}/{args.val_split} | detector-GT loss (pair-free)")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -126,11 +157,12 @@ def main() -> None:
             if len(boxes) == 0:
                 continue
             opt.zero_grad()
-            loss = det_loss(model, crit, filt, raw, fn, boxes, labels, args.input_size, dev)
+            lbl = labels if remap is None else remap[labels]
+            loss = det_loss(model, crit, filt, train_dir, fn, boxes, lbl, args.input_size, dev)
             loss = loss + args.reg_weight * filt.reg_loss()
             loss.backward()
             opt.step()
-            tr_loss += float(loss)
+            tr_loss += float(loss.detach())
         tr_loss /= max(1, len(train))
 
         filt.eval()
@@ -138,7 +170,8 @@ def main() -> None:
         for fn, W, H, boxes, labels in val:
             if len(boxes) == 0:
                 continue
-            vloss = det_loss(model, crit, filt, raw, fn, boxes, labels, args.input_size, dev)
+            lbl = labels if remap is None else remap[labels]
+            vloss = det_loss(model, crit, filt, val_dir, fn, boxes, lbl, args.input_size, dev)
             vl += float(vloss.detach())
         vl /= max(1, len(val))
 

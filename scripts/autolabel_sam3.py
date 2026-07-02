@@ -63,6 +63,8 @@ def normalize_spec(entry):
     optional `text` (list) and `boxes` (list of xyxy exemplar boxes)."""
     if isinstance(entry, dict):
         return {"text": list(entry.get("text", [])), "boxes": list(entry.get("boxes", []))}
+    if isinstance(entry, str):                  # a bare scalar is a single prompt
+        return {"text": [entry], "boxes": []}
     return {"text": list(entry), "boxes": []}
 
 
@@ -70,10 +72,13 @@ def fill_holes(mask: np.ndarray) -> np.ndarray:
     """Fill interior holes (dark screen regions inside a box-prompted object)."""
     mm = mask.astype(np.uint8)
     h, w = mm.shape
-    flood = mm.copy()
-    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(flood, ff_mask, (0, 0), 1)   # fill background from a corner
-    holes = flood == 0                          # unreachable pixels are holes
+    # Pad a 1px background border so the flood seed at the corner is guaranteed
+    # to be background even when the object touches an image edge/corner.
+    flood = np.zeros((h + 2, w + 2), np.uint8)
+    flood[1:-1, 1:-1] = mm
+    ff_mask = np.zeros((h + 4, w + 4), np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 1)   # fill exterior background from corner
+    holes = (flood == 0)[1:-1, 1:-1]            # unreachable interior pixels are holes
     return (mm.astype(bool) | holes)
 
 
@@ -274,7 +279,9 @@ def main():
         "annotations": annotations,
         "categories": [{"id": 1, "name": "object"}],
     }
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     json.dump(coco, open(args.out, "w"))
     with open(os.path.splitext(args.out)[0] + "_summary.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["file", "n", "prompts", "scores"])

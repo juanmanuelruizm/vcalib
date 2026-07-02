@@ -162,7 +162,9 @@ def main():
     print(f"filter(B) - B (AP):      {dfb:+.4f}")
     print(f"recovery (fraction of gap closed): {rec*100:.1f}%" if gap > 1e-9 else "recovery: n/a (no A>B gap)")
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["arm", "AP", "AP50", "AP75", "AR100", "level", "scenes", "checkpoint"])

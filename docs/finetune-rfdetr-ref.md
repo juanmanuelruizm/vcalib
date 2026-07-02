@@ -42,9 +42,23 @@ uv sync
 ./scripts/run_finetune_matrix.sh cuda        # regenerates data/coco, runs the matrix
 ```
 
-Results (benchmark CSVs) land in `results/ft_bench/`. ExDark (optional):
-`git clone https://github.com/cs-chan/Exclusively-Dark-Image-Dataset data/exdark_raw`
-then `uv run python scripts/exdark_to_coco.py --exdark-root data/exdark_raw --out data/coco/exdark`.
+Results (benchmark CSVs) land in `results/ft_bench/`. **ExDark** (the real, unpaired
+validation set) — the GitHub repo ships only metadata; the images (1.5 GB) and bbGt GT
+(5 MB) live on Google Drive, so `git clone` alone is **not** enough:
+
+```bash
+git clone --depth 1 https://github.com/cs-chan/Exclusively-Dark-Image-Dataset data/exdark_raw
+cd data/exdark_raw
+uv run --with gdown gdown 1BHmPgu8EsHoFDDkMGLVoXIlCth2dW6Yx -O images.zip  # 1.5 GB -> ExDark/
+uv run --with gdown gdown 1P3iO3UYn7KoBi5jiUkogJq96N6maZS1i -O gt.zip      # 5 MB  -> ExDark_Annno/
+unzip -q images.zip && unzip -q gt.zip && rm -rf __MACOSX && find . -name '._*' -delete
+cd ../.. && uv run python scripts/exdark_to_coco.py \
+    --exdark-root data/exdark_raw --out data/coco/exdark --multiclass
+```
+
+The converter auto-detects the canonical layout (`ExDark/`, `ExDark_Annno/`,
+`Groundtruth/imageclasslist.txt`) and emits `bright` (reference, 5,071 imgs) +
+`dark_{train,val,test}` (903/606/782). Delete the zips after unzip.
 
 ## Scripts (all built & validated end-to-end on Mac, except where noted)
 
@@ -59,8 +73,9 @@ then `uv run python scripts/exdark_to_coco.py --exdark-root data/exdark_raw --ou
 - `scripts/benchmark_detection.py --model-checkpoint <ckpt>` — A'/B/filter(B) on held-out test.
 - `scripts/run_finetune_matrix.sh [cuda]` — full cooktop matrix {head-only, LoRA} ×
   {no-aug, aggressive} + off-the-shelf baseline.
-- `scripts/exdark_to_coco.py` — **UNTESTED until ExDark is downloaded**; validate the bbGt/
-  `imageclasslist.txt` parsing after download.
+- `scripts/exdark_to_coco.py` — validated on the real Drive data (7,362 imgs w/ GT): auto-detects
+  the `ExDark/`+`ExDark_Annno/`+`imageclasslist.txt` layout (override via `--images-root/--gt-root/--meta`);
+  single-class by default or 12 classes with `--multiclass`.
 
 ## Gotchas to honor when interpreting results
 

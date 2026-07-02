@@ -42,12 +42,12 @@ LIGHTING = ["Low", "Ambient", "Object", "Single", "Weak", "Strong",
 DEFAULT_BRIGHT = {"Ambient", "Twilight", "Strong", "Object"}
 
 
-def parse_meta(root: Path) -> dict:
+def parse_meta(meta_path: Path) -> dict:
     """image_name -> {'lighting': str, 'split': int(1 train/2 val/3 test)}."""
     meta = {}
-    for i, line in enumerate(open(root / "imageclasslist.txt")):
+    for i, line in enumerate(open(meta_path)):
         parts = line.split()
-        if i == 0 and not parts[1].isdigit():   # header row
+        if i == 0 and (len(parts) < 2 or not parts[1].isdigit()):   # header row
             continue
         if len(parts) < 5:
             continue
@@ -71,6 +71,35 @@ def parse_gt(txt_path: Path) -> list:
     return out
 
 
+def _resolve_dir(root: Path, override, candidates: list, classes: list) -> Path:
+    """Pick the images/GT root: an explicit override, else the first candidate
+    that actually contains the per-class subfolders. Disambiguates the GitHub
+    stub dirs (``Dataset/``, ``Groundtruth/`` from the repo, which hold only
+    READMEs) from the real Drive-extracted data (``ExDark/``, ``ExDark_Annno/``)."""
+    if override:
+        return Path(override)
+    for name in candidates:
+        d = root / name
+        if d.is_dir() and any((d / c).is_dir() for c in classes):
+            return d
+    raise FileNotFoundError(
+        f"none of {candidates} under {root} contains class subfolders "
+        f"(e.g. {classes[0]}/); extract the ExDark Drive downloads first "
+        f"or pass an explicit --images-root/--gt-root"
+    )
+
+
+def _resolve_meta(root: Path, override, gt_root: Path) -> Path:
+    if override:
+        return Path(override)
+    for cand in (root / "imageclasslist.txt",
+                 root / "Groundtruth" / "imageclasslist.txt",
+                 gt_root / "imageclasslist.txt"):
+        if cand.exists():
+            return cand
+    raise FileNotFoundError(f"imageclasslist.txt not found under {root}")
+
+
 def main() -> None:
     from PIL import Image, ImageFile
     ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -78,6 +107,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--exdark-root", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--images-root", default=None,
+                    help="override images dir (default: auto-detect Dataset/ or ExDark/)")
+    ap.add_argument("--gt-root", default=None,
+                    help="override bbGt dir (default: auto-detect Groundtruth/ or ExDark_Annno/)")
+    ap.add_argument("--meta", default=None,
+                    help="override imageclasslist.txt path (default: auto-detect)")
     ap.add_argument("--bright", default=",".join(sorted(DEFAULT_BRIGHT)),
                     help="comma list of lighting conditions treated as reference/bright")
     ap.add_argument("--multiclass", action="store_true",
@@ -86,7 +121,11 @@ def main() -> None:
 
     root, out = Path(args.exdark_root), Path(args.out)
     bright = {b.strip() for b in args.bright.split(",")}
-    meta = parse_meta(root)
+    images_root = _resolve_dir(root, args.images_root, ["Dataset", "ExDark"], CLASSES)
+    gt_root = _resolve_dir(root, args.gt_root, ["Groundtruth", "ExDark_Annno"], CLASSES)
+    meta_path = _resolve_meta(root, args.meta, gt_root)
+    print(f"images_root={images_root} | gt_root={gt_root} | meta={meta_path}")
+    meta = parse_meta(meta_path)
     if args.multiclass:
         cat_id = {c: i + 1 for i, c in enumerate(CLASSES)}
         categories = [{"id": i + 1, "name": c} for i, c in enumerate(CLASSES)]
@@ -96,9 +135,10 @@ def main() -> None:
 
     # group images -> which output split (bright / dark_{train,val,test})
     groups = {"bright": [], "dark_train": [], "dark_val": [], "dark_test": []}
-    gt_root = root / "Groundtruth"
     for cls in CLASSES:
-        for img_path in sorted((root / "Dataset" / cls).glob("*")):
+        for img_path in sorted((images_root / cls).glob("*")):
+            if img_path.name.startswith("._"):
+                continue
             if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".bmp"):
                 continue
             m = meta.get(img_path.name.lower())

@@ -146,8 +146,8 @@ def to_unit_rgb(image: ImageLike, input_size: Optional[int] = None) -> torch.Ten
 
 def normalize(unit_tensor: torch.Tensor) -> torch.Tensor:
     """Apply ImageNet mean/std normalization to a (C, H, W) [0, 1] tensor."""
-    mean = torch.tensor(IMAGENET_MEAN, dtype=unit_tensor.dtype).view(3, 1, 1)
-    std = torch.tensor(IMAGENET_STD, dtype=unit_tensor.dtype).view(3, 1, 1)
+    mean = torch.tensor(IMAGENET_MEAN, dtype=unit_tensor.dtype, device=unit_tensor.device).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=unit_tensor.dtype, device=unit_tensor.device).view(3, 1, 1)
     return (unit_tensor - mean) / std
 
 

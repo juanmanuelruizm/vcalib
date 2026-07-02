@@ -12,19 +12,19 @@ IMG_4_I1,1,drinking glass,0.87
 IMG_4_I2,1,drinking glass,0.87
 IMG_4_I3,1,drinking glass,0.90
 IMG_5_I1,1,+box,0.93
-IMG_5_I2,1,+box,0.15
-IMG_5_I3,1,+box,0.10
-IMG_6_I1,1,glass,0.72
-IMG_6_I2,0,glass,-
-IMG_6_I3,1,glass,0.84
-IMG_7_I1,1,jar,0.88
-IMG_7_I2,1,jar,0.72
-IMG_7_I3,1,jar,0.74
-IMG_8_I1,2,can|bottle,"0.97,0.96"
-IMG_8_I2,2,can|bottle,"0.96,0.91"
-IMG_8_I3,2,can|bottle,"0.97,0.97"
+IMG_5_I2,1,+box,0.94
+IMG_5_I3,1,+box,0.92
+IMG_6_I1,1,glass,0.93
+IMG_6_I2,1,glass,0.93
+IMG_6_I3,1,glass,0.93
+IMG_7_I1,1,jar,0.80
+IMG_7_I2,1,jar,0.90
+IMG_7_I3,1,jar,0.71
+IMG_8_I1,2,can|bottle,"0.97,0.97"
+IMG_8_I2,2,can|bottle,"0.97,0.97"
+IMG_8_I3,2,can|bottle,"0.97,0.96"
 IMG_9_I1,1,can,0.97
-IMG_9_I2,1,can,0.45
+IMG_9_I2,1,can,0.97
 IMG_9_I3,1,can,0.97
 IMG_10_I1,1,jar,0.94
 IMG_10_I2,1,jar,0.89

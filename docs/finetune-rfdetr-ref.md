@@ -87,3 +87,38 @@ The converter auto-detects the canonical layout (`ExDark/`, `ExDark_Annno/`,
   per image (consider letterbox); watch small objects at 384².
 - **3-way split discipline**: test = final only; val = early-stop only; never leak test.
 - Fine-tune is single-class "object" (head → 2 logits) to match the GT and class-agnostic eval.
+
+## Results — ExDark (unpaired, 12-class) · 2026-07-03
+
+Full matrix run via `run_exdark_matrix.sh` (phase 2 fine-tune + phase 3 filter/eval).
+A' fine-tune on `bright`: 60 epochs, best mAP50-95 = 0.5919 @ epoch 49
+(`results/finetune/exdark_bright/weights/best.pt`). Pair-free filters trained on
+`dark_train` (val `dark_val`, GT detection loss), evaluated on `dark_test`.
+
+**Headline: the pair-free filter did NOT help — it slightly degraded AP in BOTH arms.**
+This is the falsifiable outcome the branch was designed to test; here it fires clearly.
+
+`dark_test`, B vs filter(B):
+
+| arm (label-map) | metric | B | filter(B) | Δ |
+|---|---|---|---|---|
+| **baseline** (`exdark_coco`, off-the-shelf) | AP | 0.3718 | 0.3102 | **−0.0616 (−16.6%)** |
+| | AP50 | 0.6928 | 0.5955 | −0.0973 |
+| **adapted** (`none`, A' on bright) | AP | 0.5528 | 0.5410 | **−0.0118 (−2.1%)** |
+| | AP50 | 0.8241 | 0.8038 | −0.0203 |
+
+CSVs: `results/ft_bench/exdark_{baseline,adapted}.csv` (gitignored — not in repo).
+
+Supporting signals:
+- Filter training barely moved val loss (baseline best 10.099 from ~10.13; adapted best
+  9.315 from ~9.33) and early-stopped fast (adapted @ epoch 6, baseline @ epoch 26) → the
+  filter converged to a near-identity that, on test, distorts just enough to cost AP.
+- Degradation is consistent across AP/AP50/AP75/AR100 in both arms.
+
+**Caveats when reading this:**
+- AP is **not comparable across arms** — baseline maps preds to COCO-91, adapted scores the
+  12 native ExDark classes (`label-map none`). Only the within-arm B vs filter(B) delta is clean.
+  Do not read "0.55 vs 0.37" as an adaptation gain; it is confounded by the label mapping.
+- Next steps considered but not yet run: contrast with **cooktop** (has A' + classic recovery),
+  and diagnose *why* the filter learns no useful signal (reg-weight / filter capacity / whether
+  there is any exploitable signal at all without reference pairs).

@@ -119,6 +119,39 @@ Supporting signals:
 - AP is **not comparable across arms** — baseline maps preds to COCO-91, adapted scores the
   12 native ExDark classes (`label-map none`). Only the within-arm B vs filter(B) delta is clean.
   Do not read "0.55 vs 0.37" as an adaptation gain; it is confounded by the label mapping.
-- Next steps considered but not yet run: contrast with **cooktop** (has A' + classic recovery),
-  and diagnose *why* the filter learns no useful signal (reg-weight / filter capacity / whether
-  there is any exploitable signal at all without reference pairs).
+- Next step (now done — see below): contrast with **cooktop** (has A pairs + classic recovery)
+  and diagnose *why* the filter learns no useful signal. The coupling study answers it: on
+  **paired** cooktop the filter recovers most of the detection gap, so filter capacity is not
+  the bottleneck — the ExDark null is about the **unpaired / pair-free** supervision, not the filter.
+
+## Results — activation↔detection coupling (cooktop, paired) · 2026-07-03
+
+Run: `uv run python scripts/run_coupling_study.py --device cuda --epochs 50 --eval-every 2`
+(STC `P=16, g=5` on `backbone.projector`, 41 train pairs). Every 2 epochs it records TWO
+decoupled read-outs on the 6 held-out GT-backed test scenes: **feature-gap closure** at the
+projector (the classic `test_mean`) and **AP/AP50** of filter(B) vs GT (COCOeval). Reference
+lines: A(ceiling) AP **0.5435**, B(floor) AP **0.3766** → gap **0.1669**.
+
+**Headline: closing the feature gap and improving detection are decoupled — and past a point,
+anti-correlated.** Optimizing the activation metric overshoots into a region that *costs* AP.
+
+| loss_mode | best AP (epoch) | gap recovered | feat_closure @ best | AP at max feat_closure (0.33) | max AP50 |
+|---|---|---|---|---|---|
+| `activation` | 0.4951 (ep 10) | **71%** | 0.257 | **0.4505** (ep 50) ↓ | 0.6590 |
+| `detection` | 0.5172 (ep 20) | **84%** | 0.185 | — (plateaus ~0.19) | 0.7647 |
+| `combined` | 0.5287 (ep 42) | **91%** | 0.191 | — (plateaus ~0.19) | 0.7652 |
+
+Supporting signals:
+- **Activation mode overshoots.** `feat_closure` climbs monotonically 0.17→**0.333** (our
+  known headline `test_mean`), but AP peaks early at ep 10 (0.495) and then **decays to 0.451**
+  while the feature gap keeps closing; AP50 falls 0.659→0.552. The pure-feature optimum is *not*
+  the detection optimum — the headline `test_mean=0.3338` config maximizes the wrong thing.
+- **Detection / combined win with LESS feature closure.** Both plateau at `feat_closure ≈ 0.19`
+  (vs 0.33) yet reach far higher AP (0.52–0.53) and AP50 (~0.76), and are **stable** — no tail
+  decay. `combined` recovers **91%** of the A→B AP gap.
+- **So the filter works when the supervision sees detection.** On paired cooktop the capacity is
+  ample; the ExDark degradation above is a property of the unpaired/pair-free signal, not the filter.
+
+Practical takeaway: for detection recovery use `loss_mode=combined` (or `detection`) and
+early-stop on **AP**, not on the feature metric. Raw trajectories:
+`results/coupling/{activation,detection,combined}.jsonl` (CSV `coupling.csv` is gitignored).

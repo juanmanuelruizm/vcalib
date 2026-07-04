@@ -77,6 +77,194 @@ The converter auto-detects the canonical layout (`ExDark/`, `ExDark_Annno/`,
   the `ExDark/`+`ExDark_Annno/`+`imageclasslist.txt` layout (override via `--images-root/--gt-root/--meta`);
   single-class by default or 12 classes with `--multiclass`.
 
+## Extending to other LibreYOLO families (branch `finetune-all-models`)
+
+`src/utils/activations.py::load_model()` / `src/calibration.py` now take a
+`family` param (default `"rfdetr"`, unchanged behavior) so the same
+fine-tune → pair-free-filter → benchmark recipe can target other LibreYOLO
+model families. Per-family fine-tune scripts:
+
+- `scripts/finetune_rtdetrv4.py` (`family="rtdetrv4"`) — DETR-lineage, shares
+  RF-DETR's `{pred_logits, pred_boxes}` output contract, no `NestedTensor`
+  needed. `--freeze` works (generic integer groups, not named). `--lora` is
+  **not** supported (only RF-DETR's trainer sets `supports_lora=True`).
+- `scripts/finetune_yolo9.py` (`family="yolo9"`) — anchor-free `DDetect` head,
+  needs its own output adapter: `detection_output_loss_yolo9` in
+  `src/calibration.py` (BCE on per-anchor sigmoid class scores + L1 on decoded
+  boxes, anchor-aligned since anchors are deterministic per input resolution)
+  and a `family="yolo9"` branch in `scripts/benchmark_detection.py::detect()`.
+  `--freeze` supports **named** groups (e.g. `backbone.conv0`) here, unlike
+  RT-DETRv4/D-FINE.
+- `scripts/finetune_fomo.py` (`family="fomo"`) — **separate, lower-confidence
+  track**: LibreFOMO is a point-localizer (no AP metric applies), has no
+  redistributable pretrained weights (must pass `--model-path` or train from
+  random init), and its own `.train()` requires `allow_experimental=True` and
+  is flagged unstable upstream. Its own pair-free loss adapter is
+  `detection_output_loss_fomo` (per-cell KL over its dense heatmap output — no
+  box term, since FOMO has no box head). Full validation still needs a
+  point-distance/recall-at-radius eval metric, not yet implemented (there is no
+  `benchmark_detection.py` equivalent for this family — AP doesn't apply).
+
+Layer discovery for all non-`rfdetr` families uses each model's own
+`get_available_layer_names()` (a stable API every LibreYOLO family
+implements) rather than vcalib's hand-picked `LAYER_PATHS` dotted-path dict,
+which stays RF-DETR-only.
+
+**Checkpoint disk hygiene — do this after every family's run, physically, on
+whichever machine ran it:** fine-tuned/filter checkpoints
+(`results/finetune/<name>/weights/*.pt`, `results/experiments/runs/<name>/best.pt`)
+are working files, not the artifact of record — the committed YAML config +
+seed + this recipe is what's reproducible, not the binary. Once a family's
+results row is verified in the CSV/this doc, delete its local checkpoints:
+
+```bash
+rm -rf results/finetune/*<family>* results/experiments/runs/*<family>*
+```
+
+`results/finetune/`, `results/experiments/runs/`, and `results/**/*.pt` are
+already gitignored, but that only stops future commits — it does nothing about
+what's already on disk from runs just completed. This is a real, deliberate
+`rm` step per family, not something to leave to `.gitignore`.
+
+## Results — RT-DETRv4 / YOLOv9 fine-tune + REAL pair-free filter · 2026-07-04
+
+Full pipeline, both steps, both families: (1) fine-tune on I1 → frozen A'
+ceiling, (2) train a **real, GT-supervised, pair-free** filter (no reference
+image, detector's own GT loss) against the frozen A', (3) benchmark A'/B/filter(B)
+on the 6 held-out SAM3-labeled test scenes. Unlike the identity-filter smoke
+check earlier in this session (superseded — see git history of this file if
+needed), `filter(B)` below is a genuinely trained filter.
+
+**New code this required** (the earlier version of this doc flagged this as a
+gap; now closed):
+- `scripts/train_filter_detloss_rtdetrv4.py` — builds `HungarianMatcher` +
+  `DFINECriterion` with the exact hyperparameters D-FINE's own trainer uses
+  (`3rd_party/libreyolo/libreyolo/models/dfine/trainer.py::on_setup`), since
+  `LibreRTDETRv4`/`LibreDFINE` expose no `build_criterion_and_postprocess()`
+  wrapper the way RF-DETR does.
+- `scripts/train_filter_detloss_yolo9.py` — YOLOv9 needs no separate criterion
+  object: `LibreYOLO9Model.forward(x, targets=...)` in training mode routes to
+  its own `YOLO9Loss` (Task-Aligned-Assignment) internally and returns
+  `{"total_loss": ..., ...}` directly. Needed a cxcywh→xyxy target-format
+  conversion (`cxcywh_to_yolo9_targets`) since vcalib's shared `load_split()`
+  (from `train_filter_detloss.py`) produces cxcywh-normalized boxes.
+- **Both** needed `src/calibration.py::train_mode_except_norm` — a new
+  context manager. `DFINECriterion` *requires* `aux_outputs` in the model
+  output, which the decoder only emits when `self.training=True`
+  (`dfine/decoder.py:898`); YOLOv9's internal loss path is similarly gated on
+  training mode. But the model must stay frozen (`requires_grad=False`
+  already holds) — the risk is BatchNorm's running_mean/running_var buffers,
+  which update on every train-mode forward pass **regardless of
+  requires_grad**. `train_mode_except_norm` sets `.train()` on the whole
+  module but immediately forces every `BatchNorm{1,2,3}d` submodule back to
+  `.eval()`, so training-mode code paths activate without drifting frozen BN
+  statistics.
+
+**Exact commands to regenerate everything below:**
+
+```bash
+uv run python scripts/make_detection_coco.py --levels 1 --out data/coco/cooktop_ref
+uv run python scripts/make_detection_coco.py --levels 2 --out data/coco/cooktop_shift_lv2
+uv run python scripts/make_detection_coco.py --levels 3 --out data/coco/cooktop_shift_lv3
+
+# step 1: fine-tune ceilings
+uv run python scripts/finetune_rtdetrv4.py --data data/coco/cooktop_ref/data.yaml \
+    --project results/finetune --name cooktop_rtdetrv4_s_full \
+    --size s --epochs 60 --batch 4 --device cuda --seed 42
+uv run python scripts/finetune_yolo9.py --data data/coco/cooktop_ref/data.yaml \
+    --project results/finetune --name cooktop_yolo9_t_full \
+    --size t --epochs 60 --batch 4 --device cuda --seed 42
+
+# step 2: pair-free filter, per family per shifted level (lv=2,3)
+uv run python scripts/train_filter_detloss_rtdetrv4.py \
+    --data data/coco/cooktop_shift_lv<lv> \
+    --model-checkpoint results/finetune/cooktop_rtdetrv4_s_full/weights/best.pt \
+    --size s --input-size 640 --out results/experiments/runs/pairfree_rtdetrv4_lv<lv> \
+    --epochs 50 --patience 10 --device cuda --seed 42
+uv run python scripts/train_filter_detloss_yolo9.py \
+    --data data/coco/cooktop_shift_lv<lv> \
+    --model-checkpoint results/finetune/cooktop_yolo9_t_full/weights/best.pt \
+    --size t --input-size 640 --out results/experiments/runs/pairfree_yolo9_lv<lv> \
+    --epochs 50 --patience 10 --device cuda --seed 42
+
+# step 3: benchmark
+uv run python scripts/benchmark_detection.py --level <lv> --family <family> --size <size> \
+    --input-size 640 --model-checkpoint <finetune-ckpt> \
+    --checkpoint results/experiments/runs/pairfree_<family>_lv<lv>/best.pt --device cuda
+```
+
+**IMPORTANT reproducibility caveat found this run**: re-running the *identical*
+RT-DETRv4 fine-tune command (same seed=42, same code, same 20-image dataset)
+produced a **different** result across two runs in this session — first run
+best mAP50-95=0.8403 @ epoch 50, second run best mAP50-95=0.6915 @ epoch 20.
+YOLOv9's fine-tune was bit-identical across both runs (0.4976 @ epoch 50,
+matched exactly). So `--seed` does **not** guarantee reproducibility for
+RT-DETRv4 on this box — likely non-deterministic CUDA ops in its deformable-
+attention/transformer path (cuDNN algorithm selection, non-deterministic
+atomics in backward, or similar), not a code bug introduced here. **Practical
+implication**: for RT-DETRv4, treat "the config + seed" as reproducing *a*
+result in the same distribution, not a bit-exact one — re-run and average
+if a precise number matters. The table below uses the **second** (regenerated)
+fine-tune checkpoint, since that's the one the filters were actually trained
+against.
+
+**Fine-tune ceiling metrics** (val split, 4 images — sanity check, not reliable
+on its own):
+
+| family | size | best epoch | val mAP50-95 | val mAP50 | wall time |
+|---|---|---|---|---|---|
+| RT-DETRv4 | s | 20/60 | 0.6915 | 0.6943 | 1m40s |
+| YOLOv9 | t | 50/60 | 0.4976 | 0.8000 | 0m54s |
+
+**Pair-free filter training** (`spatial_tone_curve(P=16, grid_size=5)`,
+`reg_weight=0.01`, `lr=0.005`, early-stop patience 10):
+
+| family | level | best val loss | best epoch | early-stopped @ |
+|---|---|---|---|---|
+| RT-DETRv4 | 2 | 19.7339 | 4 | 14 |
+| RT-DETRv4 | 3 | 16.9124 | 1 | 11 |
+| YOLOv9 | 2 | 5.1892 | 25 | 35 |
+| YOLOv9 | 3 | 6.2277 | 20 | 30 |
+
+**A'/B/filter(B) benchmark** (6 held-out SAM3-labeled test scenes):
+
+| family | level | A' (AP) | B (AP) | filter(B) (AP) | A'→B gap | recovery |
+|---|---|---|---|---|---|---|
+| RT-DETRv4 | 2 | 0.5284 | 0.5394 | 0.5784 | −0.0110 (B>A') | n/a — filter still **+0.039 AP** over B |
+| RT-DETRv4 | 3 | 0.5284 | 0.4095 | 0.4060 | +0.1189 | **−2.9%** (slightly worse than B) |
+| YOLOv9 | 2 | 0.2263 | 0.0939 | 0.2607 | +0.1324 | **+125.9%** (filter(B) exceeds A'!) |
+| YOLOv9 | 3 | 0.2263 | 0.1240 | 0.1733 | +0.1023 | **+48.2%** |
+
+**Reading this table — real, if noisy, signal:**
+- **YOLOv9 shows real recovery.** On level 2 the trained filter doesn't just
+  close the A'→B gap, it *exceeds the fine-tuned ceiling itself*
+  (filter(B)=0.2607 > A'=0.2263) — meaning the filter is doing something
+  beyond simply undoing the illumination shift; it may be exploiting an
+  interaction between `spatial_tone_curve`'s contrast/tone adjustments and
+  YOLOv9's specific training distribution. Level 3 recovers a solid 48%.
+  Given YOLOv9's low absolute AP ceiling (0.23) on this tiny dataset, treat the
+  125.9% figure as encouraging but noisy, not a load-bearing number — it would
+  need more test scenes / repeated seeds to trust as a precise percentage.
+- **RT-DETRv4 shows no reliable recovery** — level 3's small negative "recovery"
+  (−2.9%) and level 2's undefined case (B already exceeds A', so "gap" isn't
+  meaningful) both suggest RT-DETRv4-s here is either already fairly robust to
+  this cooktop shift, or the filter/criterion interaction isn't working well
+  for this architecture yet. Given the fine-tune reproducibility issue above,
+  this A' ceiling itself is noisier than YOLOv9's — don't over-read a single run.
+- Neither family had enough of a controlled comparison (single seed, single
+  fine-tune run, tiny 20-image train set) to be a confident final answer —
+  this is a first real data point, not a validated conclusion. A next step
+  would be repeating each cell across 2-3 seeds to see if YOLOv9's positive
+  signal and RT-DETRv4's null both hold up.
+
+**Checkpoint disk hygiene applied**: `results/finetune/cooktop_rtdetrv4_s_full/`
+(1.3GB), `results/finetune/cooktop_yolo9_t_full/` (197MB), and the four
+`results/experiments/runs/pairfree_{rtdetrv4,yolo9}_lv{2,3}/` filter checkpoints
+(16KB each) were deleted from local disk after every number in this section was
+recorded here. Regenerate via the exact commands above if needed again — note
+the RT-DETRv4 non-determinism caveat means a regenerated RT-DETRv4 ceiling may
+not exactly match 0.6915/0.6943 even with the same seed.
+
 ## Gotchas to honor when interpreting results
 
 - In the pure realistic (unpaired) framing there is **no A ceiling** → report **absolute AP

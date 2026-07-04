@@ -57,17 +57,45 @@ def cxcywh_to_xywh_pixels(boxes: torch.Tensor, W: int, H: int):
     return torch.stack([x0, y0, x1 - x0, y1 - y0], dim=-1)
 
 
+def xyxy_pixels_to_xywh(boxes: torch.Tensor, W: int, H: int, imgsz: int):
+    """Rescale YOLOv9's decoded xyxy boxes (pixel scale of the square ``imgsz`` input)
+    to the original frame's (W, H) and convert to COCO xywh."""
+    sx, sy = W / imgsz, H / imgsz
+    x0, y0, x1, y1 = boxes.unbind(-1)
+    x0, x1 = (x0 * sx).clamp(0, W), (x1 * sx).clamp(0, W)
+    y0, y1 = (y0 * sy).clamp(0, H), (y1 * sy).clamp(0, H)
+    return torch.stack([x0, y0, x1 - x0, y1 - y0], dim=-1)
+
+
 @torch.no_grad()
-def detect(libre, unit: torch.Tensor, W: int, H: int, image_id: int, max_det: int, device):
-    """Class-agnostic detections as COCO results dicts for one frame."""
+def detect(libre, unit: torch.Tensor, W: int, H: int, image_id: int, max_det: int, device, family: str = "rfdetr"):
+    """Class-agnostic detections as COCO results dicts for one frame.
+
+    ``family="yolo9"`` uses YOLOv9's dense per-anchor ``DDetect`` output
+    (``{"predictions": (1, 4+nc, N)}``, decoded xyxy boxes + per-class sigmoid
+    scores) instead of RF-DETR/DEIM/D-FINE/RT-DETRv4's query-based
+    ``{pred_logits, pred_boxes}``. See ``detection_output_loss_yolo9`` in
+    ``src/calibration.py`` for the analogous pair-free-loss adapter.
+    """
     normed = normalize(unit).unsqueeze(0).to(device)
     out = libre.model(normed)
-    logits = out["pred_logits"][0]          # (Q, C)
-    boxes = out["pred_boxes"][0]            # (Q, 4) cxcywh normalized
-    scores = logits.sigmoid().amax(dim=-1)  # per-query objectness
-    k = min(max_det, scores.shape[0])
-    topv, topi = scores.topk(k)
-    xywh = cxcywh_to_xywh_pixels(boxes[topi].float().cpu(), W, H)
+
+    if family == "yolo9":
+        pred = out["predictions"][0]        # (4+nc, N)
+        boxes_xyxy, cls = pred[:4].T, pred[4:]  # (N, 4), (nc, N)
+        scores = cls.amax(dim=0)                # per-anchor best-class score (already sigmoid)
+        k = min(max_det, scores.shape[0])
+        topv, topi = scores.topk(k)
+        imgsz = unit.shape[-1]
+        xywh = xyxy_pixels_to_xywh(boxes_xyxy[topi].float().cpu(), W, H, imgsz)
+    else:
+        logits = out["pred_logits"][0]          # (Q, C)
+        boxes = out["pred_boxes"][0]            # (Q, 4) cxcywh normalized
+        scores = logits.sigmoid().amax(dim=-1)  # per-query objectness
+        k = min(max_det, scores.shape[0])
+        topv, topi = scores.topk(k)
+        xywh = cxcywh_to_xywh_pixels(boxes[topi].float().cpu(), W, H)
+
     res = []
     for i in range(k):
         b = [round(float(v), 2) for v in xywh[i]]
@@ -100,7 +128,10 @@ def main():
     ap.add_argument("--input-size", type=int, default=384)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--model-checkpoint", default=None,
-                    help="fine-tuned RF-DETR checkpoint (weights/best.pt); default = off-the-shelf nano")
+                    help="fine-tuned checkpoint (weights/best.pt); default = off-the-shelf pretrained")
+    ap.add_argument("--family", default="rfdetr",
+                    help="model family key (rfdetr, rtdetrv4, yolo9, fomo); see src/utils/activations.py")
+    ap.add_argument("--size", default="n", help="model size code (family-specific)")
     ap.add_argument("--out", default="results/detection_benchmark.csv")
     args = ap.parse_args()
 
@@ -121,7 +152,7 @@ def main():
         scenes = [int(s) for s in args.scenes.split(",")]
 
     raw = Path(args.gt).parent.parent / "raw"
-    libre = load_model(size="n", device=args.device, model_path=args.model_checkpoint)
+    libre = load_model(size=args.size, device=args.device, model_path=args.model_checkpoint, family=args.family)
     filt = build_filter(spec).to(args.device).eval()
     filt.load_state_dict(torch.load(args.checkpoint, map_location=args.device, weights_only=False))
     print(f"filter {spec} <- {args.checkpoint}")
@@ -139,9 +170,9 @@ def main():
         b_unit = to_unit_rgb(raw / b_name, args.input_size)
         with torch.no_grad():
             fb_unit = filt(b_unit.unsqueeze(0).to(args.device))[0].clamp(0, 1).cpu()
-        preds["A"] += detect(libre, a_unit, *dims[a_id], a_id, args.max_det, args.device)
-        preds["B"] += detect(libre, b_unit, *dims[b_id], b_id, args.max_det, args.device)
-        preds["filterB"] += detect(libre, fb_unit, *dims[b_id], b_id, args.max_det, args.device)
+        preds["A"] += detect(libre, a_unit, *dims[a_id], a_id, args.max_det, args.device, args.family)
+        preds["B"] += detect(libre, b_unit, *dims[b_id], b_id, args.max_det, args.device, args.family)
+        preds["filterB"] += detect(libre, fb_unit, *dims[b_id], b_id, args.max_det, args.device, args.family)
         ids["A"].append(a_id); ids["B"].append(b_id); ids["filterB"].append(b_id)
 
     stats = {k: evaluate(gt, preds[k], ids[k]) for k in preds}

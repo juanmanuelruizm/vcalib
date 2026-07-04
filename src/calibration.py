@@ -27,13 +27,13 @@ import torch
 import torch.nn.functional as F
 
 from src.utils.activations import (
+    FAMILIES_REQUIRING_NESTED_TENSOR,
     IMAGENET_MEAN,
     IMAGENET_STD,
-    _inner_model,
+    _get_layer_module,
     _model_device,
     _to_tensor,
     load_model,
-    resolve_layer_path,
 )
 
 EPS = 1e-6
@@ -46,12 +46,48 @@ def _make_nested_tensor(x: torch.Tensor) -> "Any":
     that fails when ``img`` requires grad (the filter's output) but ``pad_img`` (from
     ``torch.zeros``) does not. Our input is always a single square image — no padding
     needed — so the mask is all False.
+
+    RF-DETR-only: it's the only LibreYOLO family whose forward expects a NestedTensor;
+    see :data:`FAMILIES_REQUIRING_NESTED_TENSOR`. Other families take the plain tensor.
     """
     from libreyolo.models.rfdetr.tensors import NestedTensor
 
     B, _, H, W = x.shape
     mask = torch.zeros((B, H, W), dtype=torch.bool, device=x.device)
     return NestedTensor(x, mask)
+
+
+def _forward_input(x: torch.Tensor, family: str = "rfdetr") -> Any:
+    """Wrap the model input per family's forward contract (NestedTensor vs. plain tensor)."""
+    if family in FAMILIES_REQUIRING_NESTED_TENSOR:
+        return _make_nested_tensor(x)
+    return x
+
+
+@contextmanager
+def train_mode_except_norm(module: torch.nn.Module):
+    """Temporarily set ``module.train()`` while forcing BatchNorm*d submodules to stay
+    in eval mode (no running-stat updates), then restore ``module.eval()`` on exit.
+
+    Needed for GT-supervised pair-free filter training against RT-DETRv4/D-FINE and
+    YOLOv9: both only emit their full training-mode output (D-FINE/RT-DETRv4's
+    ``aux_outputs``/``dn_outputs`` that ``DFINECriterion`` requires; YOLOv9's internal
+    ``YOLO9Loss`` computation path) when ``self.training`` is True on the relevant
+    parent modules. The model must otherwise stay frozen (``CLAUDE.md``: "the model
+    stays frozen throughout") — ``requires_grad=False`` already stops weight updates,
+    but BatchNorm's running_mean/running_var buffers update on every forward pass in
+    train mode regardless of requires_grad, so those must be pinned to eval separately.
+    """
+    bn_types = (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)
+    was_training = module.training
+    module.train()
+    bn_modules = [m for m in module.modules() if isinstance(m, bn_types)]
+    for m in bn_modules:
+        m.eval()
+    try:
+        yield
+    finally:
+        module.train(was_training)
 
 
 @dataclass
@@ -157,9 +193,8 @@ def group_loss(
 
 
 @contextmanager
-def _grad_hooks(model: Any, layer_names: Sequence[str]):
+def _grad_hooks(model: Any, layer_names: Sequence[str], family: str = "rfdetr"):
     """Register forward hooks that capture activations **without detaching** (grad flows)."""
-    inner = _inner_model(model)
     handles: List[Any] = []
     acts: Dict[str, torch.Tensor] = {}
 
@@ -172,8 +207,7 @@ def _grad_hooks(model: Any, layer_names: Sequence[str]):
         return _fn
 
     for name in layer_names:
-        path = resolve_layer_path(name)
-        mod = inner.get_submodule(path)
+        mod = _get_layer_module(model, name, family=family)
         handles.append(mod.register_forward_hook(_hook(name)))
     try:
         yield acts
@@ -186,6 +220,7 @@ def compute_reference_activations(
     model: Any,
     unit_image: torch.Tensor,
     layer_names: Sequence[str],
+    family: str = "rfdetr",
 ) -> Dict[str, torch.Tensor]:
     """Forward an A image (3,H,W [0,1]) through the frozen model; return detached targets.
 
@@ -196,13 +231,17 @@ def compute_reference_activations(
     dev = _model_device(model)
     dtype = next(model.model.parameters()).dtype
     x = _normalize_batch(unit_image.unsqueeze(0).to(dev, dtype), dev, dtype)
-    with _grad_hooks(model, layer_names) as acts:
-        model.model(_make_nested_tensor(x))
+    with _grad_hooks(model, layer_names, family=family) as acts:
+        model.model(_forward_input(x, family))
     return {k: v.detach().clone() for k, v in acts.items()}
 
 
 def _forward_filtered(
-    model: Any, filt: torch.nn.Module, b_unit: torch.Tensor, layer_names: Sequence[str]
+    model: Any,
+    filt: torch.nn.Module,
+    b_unit: torch.Tensor,
+    layer_names: Sequence[str],
+    family: str = "rfdetr",
 ) -> Dict[str, torch.Tensor]:
     """Apply filter to B [0,1], normalize, forward through model; return grad-attached acts."""
     dev = _model_device(model)
@@ -210,15 +249,29 @@ def _forward_filtered(
     b = b_unit.to(dev, dtype).unsqueeze(0)
     filtered = filt(b)  # (1, 3, H, W) [0,1], base clamps
     normed = _normalize_batch(filtered, dev, dtype)
-    with _grad_hooks(model, layer_names) as acts:
-        model.model(_make_nested_tensor(normed))
+    with _grad_hooks(model, layer_names, family=family) as acts:
+        model.model(_forward_input(normed, family))
     return cast(Dict[str, torch.Tensor], acts)
+
+
+def _as_det_dict(det_out: Any) -> Dict[str, torch.Tensor]:
+    """Normalize a raw detection-forward output to a dict.
+
+    RF-DETR/DEIM/D-FINE/RT-DETRv4 already return ``{pred_logits, pred_boxes}``.
+    YOLOv9 returns ``{"predictions": ...}`` (plus non-tensor extras). LibreFOMO's
+    ``forward()`` returns a bare ``(B, nc+1, H', W')`` heatmap tensor (no boxes,
+    no dict) — wrap it as ``{"heatmap": tensor}`` for a uniform contract.
+    """
+    if isinstance(det_out, torch.Tensor):
+        return {"heatmap": det_out}
+    return det_out
 
 
 def _reference_with_detection(
     model: Any,
     unit_image: torch.Tensor,
     layer_names: Sequence[str],
+    family: str = "rfdetr",
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Like compute_reference_activations but also returns detached detection output.
 
@@ -227,8 +280,8 @@ def _reference_with_detection(
     dev = _model_device(model)
     dtype = next(model.model.parameters()).dtype
     x = _normalize_batch(unit_image.unsqueeze(0).to(dev, dtype), dev, dtype)
-    with _grad_hooks(model, layer_names) as acts:
-        det_out = model.model(_make_nested_tensor(x))
+    with _grad_hooks(model, layer_names, family=family) as acts:
+        det_out = _as_det_dict(model.model(_forward_input(x, family)))
     acts_detached = {k: v.detach().clone() for k, v in acts.items()}
     det_detached = {k: v.detach() for k, v in det_out.items() if isinstance(v, torch.Tensor)}
     return acts_detached, det_detached
@@ -239,6 +292,7 @@ def _forward_filtered_full(
     filt: torch.nn.Module,
     b_unit: torch.Tensor,
     layer_names: Sequence[str],
+    family: str = "rfdetr",
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Like _forward_filtered but also returns detection output with gradients attached."""
     dev = _model_device(model)
@@ -246,8 +300,8 @@ def _forward_filtered_full(
     b = b_unit.to(dev, dtype).unsqueeze(0)
     filtered = filt(b)
     normed = _normalize_batch(filtered, dev, dtype)
-    with _grad_hooks(model, layer_names) as acts:
-        det_out = model.model(_make_nested_tensor(normed))
+    with _grad_hooks(model, layer_names, family=family) as acts:
+        det_out = _as_det_dict(model.model(_forward_input(normed, family)))
     return cast(Dict[str, torch.Tensor], acts), det_out
 
 
@@ -266,6 +320,55 @@ def detection_output_loss(
     return logit_loss + box_loss
 
 
+def detection_output_loss_yolo9(
+    a_det: Dict[str, torch.Tensor],
+    b_det: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Anchor-aligned BCE(cls) + L1(boxes) between A and filtered-B YOLOv9 outputs.
+
+    YOLOv9's ``DDetect`` head (unlike RF-DETR/DEIM/D-FINE/RT-DETRv4's DETR-style
+    query outputs) is a dense per-anchor grid: for a fixed input resolution the
+    anchor centers/strides are deterministic (``DDetect._make_anchors``), so A's
+    and filtered-B's anchor ``i`` is the *same* spatial location — no query
+    matching needed, unlike ``detection_output_loss``'s softmax-over-queries.
+    Class scores are already independent per-class sigmoid probabilities (not a
+    single softmax over a class dimension, since anchor-based heads are
+    multi-label per box), hence BCE rather than KL-divergence.
+
+    Expects each ``*_det`` to be the raw inference-mode
+    ``LibreYOLO9Model.forward()`` output dict: ``{"predictions": (B, 4+nc, N)}``
+    with box coords in ``[:4]`` (decoded xyxy, pixel scale) and class scores in
+    ``[4:]`` (post-sigmoid). No GT labels needed — A's own predictions are the
+    pseudo-label target.
+    """
+    a_pred = a_det["predictions"].detach()
+    b_pred = b_det["predictions"]
+    a_boxes, a_cls = a_pred[:, :4], a_pred[:, 4:]
+    b_boxes, b_cls = b_pred[:, :4], b_pred[:, 4:]
+    cls_loss = F.binary_cross_entropy(b_cls.clamp(EPS, 1 - EPS), a_cls)
+    box_loss = F.l1_loss(b_boxes, a_boxes)
+    return cls_loss + box_loss
+
+
+def detection_output_loss_fomo(
+    a_det: Dict[str, torch.Tensor],
+    b_det: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Per-cell KL(heatmap) between A and filtered-B LibreFOMO outputs.
+
+    LibreFOMO is a point-localizer, not a box detector: ``forward()`` returns a
+    single dense ``(B, nc+1, H', W')`` heatmap (background + nc foreground
+    classes per grid cell), wrapped by :func:`_as_det_dict` as
+    ``{"heatmap": tensor}`` — no boxes, no query/anchor alignment needed since
+    it's already a fixed spatial grid. Pseudo-label target is A's own softmax
+    over the class dimension, mirroring ``detection_output_loss``'s KL term but
+    with no analogous box-regression term (FOMO has no box head).
+    """
+    a_probs = F.softmax(a_det["heatmap"].detach(), dim=1)
+    b_log_probs = F.log_softmax(b_det["heatmap"], dim=1)
+    return F.kl_div(b_log_probs, a_probs, reduction="batchmean")
+
+
 def calibrate(
     filt: torch.nn.Module,
     a_unit: torch.Tensor,
@@ -277,6 +380,7 @@ def calibrate(
     cfg: Optional[CalibrationConfig] = None,
     val_a_unit: Optional[torch.Tensor] = None,
     val_b_unit: Optional[torch.Tensor] = None,
+    family: str = "rfdetr",
 ) -> Tuple[torch.nn.Module, CalibrationResult]:
     """Train ``filt`` so filtered-B activations match stored-A at ``layer_names``.
 
@@ -296,7 +400,7 @@ def calibrate(
     """
     cfg = cfg or CalibrationConfig()
     torch.manual_seed(cfg.seed)
-    model = model or load_model(size=size, device=device)
+    model = model or load_model(size=size, device=device, family=family)
     dev = _model_device(model)
 
     filt = filt.to(dev)
@@ -308,9 +412,9 @@ def calibrate(
     # NB: no torch.no_grad() — the model is frozen (params requires_grad=False), so no graph
     # is built. Using no_grad here conflicts with the DINOv2 backbone's inplace ops when the
     # training pass later runs in grad mode ("view created in no_grad modified in grad").
-    a_acts = compute_reference_activations(model, a_unit, layer_names)
+    a_acts = compute_reference_activations(model, a_unit, layer_names, family=family)
     val_a_acts = (
-        compute_reference_activations(model, val_a_unit, layer_names)
+        compute_reference_activations(model, val_a_unit, layer_names, family=family)
         if val_a_unit is not None
         else None
     )
@@ -330,7 +434,7 @@ def calibrate(
 
     for step in range(1, cfg.max_steps + 1):
         opt.zero_grad(set_to_none=True)
-        b_acts = _forward_filtered(model, filt, b_unit, layer_names)
+        b_acts = _forward_filtered(model, filt, b_unit, layer_names, family=family)
         loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation)
         if cfg.reg_weight > 0:
             loss = loss + cfg.reg_weight * cast(Any, filt).reg_loss()
@@ -344,7 +448,7 @@ def calibrate(
         # Validation (detached, no optimizer step).
         v_loss: Optional[float] = None
         if val_a_acts is not None and val_b_unit is not None:
-            vb_acts = _forward_filtered(model, filt, val_b_unit, layer_names)
+            vb_acts = _forward_filtered(model, filt, val_b_unit, layer_names, family=family)
             vl = group_loss(val_a_acts, vb_acts, layer_names, cfg.metric, cfg.aggregation)
             if cfg.reg_weight > 0:
                 vl = vl + cfg.reg_weight * cast(Any, filt).reg_loss()
@@ -423,6 +527,7 @@ def calibrate_multi(
     model: Any,
     cfg: Optional[CalibrationConfig] = None,
     test_pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+    family: str = "rfdetr",
 ) -> Tuple[torch.nn.Module, CalibrationResult]:
     """Train ``filt`` on MULTIPLE A/B pairs (cycling through them each step).
 
@@ -458,7 +563,7 @@ def calibrate_multi(
     print(f"  [calibrate_multi] precomputing A activations for {len(train_pairs)} train pairs...")
     a_acts_all: List[Dict[str, torch.Tensor]] = []
     for i, (a_unit, _) in enumerate(train_pairs):
-        a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+        a_acts_all.append(compute_reference_activations(model, a_unit, layer_names, family=family))
         if (i + 1) % 20 == 0 or (i + 1) == len(train_pairs):
             print(f"    A activations: {i+1}/{len(train_pairs)}")
 
@@ -467,7 +572,7 @@ def calibrate_multi(
     if test_pairs:
         print(f"  [calibrate_multi] precomputing A activations for {len(test_pairs)} test pairs...")
         for a_unit, _ in test_pairs:
-            test_a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+            test_a_acts_all.append(compute_reference_activations(model, a_unit, layer_names, family=family))
 
     opt = torch.optim.Adam(filt.parameters(), lr=cfg.learning_rate)
 
@@ -492,7 +597,7 @@ def calibrate_multi(
         _, b_unit = train_pairs[pair_idx]
 
         opt.zero_grad(set_to_none=True)
-        b_acts = _forward_filtered(model, filt, b_unit, layer_names)
+        b_acts = _forward_filtered(model, filt, b_unit, layer_names, family=family)
         loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation)
         if cfg.reg_weight > 0:
             loss = loss + cfg.reg_weight * cast(Any, filt).reg_loss()
@@ -508,7 +613,7 @@ def calibrate_multi(
         if test_pairs and test_a_acts_all:
             vlosses = []
             for ti, (_, tb_unit) in enumerate(test_pairs):
-                vb_acts = _forward_filtered(model, filt, tb_unit, layer_names)
+                vb_acts = _forward_filtered(model, filt, tb_unit, layer_names, family=family)
                 vl = group_loss(test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation)
                 vlosses.append(float(vl.detach()))
             v_loss = sum(vlosses) / len(vlosses)
@@ -564,6 +669,7 @@ def calibrate_epochs(
     cfg: Optional[CalibrationConfig] = None,
     test_pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
     on_epoch_end: Optional[Callable[[int, float, Optional[float], torch.nn.Module], None]] = None,
+    family: str = "rfdetr",
 ) -> Tuple[torch.nn.Module, CalibrationResult]:
     """Train ``filt`` on MULTIPLE A/B pairs with an epoch-based loop.
 
@@ -610,11 +716,11 @@ def calibrate_epochs(
     a_det_all: List[Dict[str, torch.Tensor]] = []
     for i, (a_unit, _) in enumerate(train_pairs):
         if use_det:
-            acts, det = _reference_with_detection(model, a_unit, layer_names)
+            acts, det = _reference_with_detection(model, a_unit, layer_names, family=family)
             a_acts_all.append(acts)
             a_det_all.append(det)
         else:
-            a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+            a_acts_all.append(compute_reference_activations(model, a_unit, layer_names, family=family))
         if (i + 1) % 20 == 0 or (i + 1) == n:
             print(f"    A activations: {i+1}/{n}")
 
@@ -624,11 +730,11 @@ def calibrate_epochs(
         print(f"  [calibrate_epochs] precomputing A activations for {len(test_pairs)} test pairs...")
         for a_unit, _ in test_pairs:
             if use_det:
-                acts, det = _reference_with_detection(model, a_unit, layer_names)
+                acts, det = _reference_with_detection(model, a_unit, layer_names, family=family)
                 test_a_acts_all.append(acts)
                 test_a_det_all.append(det)
             else:
-                test_a_acts_all.append(compute_reference_activations(model, a_unit, layer_names))
+                test_a_acts_all.append(compute_reference_activations(model, a_unit, layer_names, family=family))
 
     if cfg.optimizer == "adamw":
         opt: torch.optim.Optimizer = torch.optim.AdamW(
@@ -672,7 +778,7 @@ def calibrate_epochs(
 
             opt.zero_grad(set_to_none=True)
             if use_det:
-                b_acts, b_det = _forward_filtered_full(model, filt, b_unit, layer_names)
+                b_acts, b_det = _forward_filtered_full(model, filt, b_unit, layer_names, family=family)
                 a_det = a_det_all[pair_idx]
                 if cfg.loss_mode == "detection":
                     loss = detection_output_loss(a_det, b_det)
@@ -681,7 +787,7 @@ def calibrate_epochs(
                     det_loss = detection_output_loss(a_det, b_det)
                     loss = feat_loss + cfg.detection_weight * det_loss
             else:
-                b_acts = _forward_filtered(model, filt, b_unit, layer_names)
+                b_acts = _forward_filtered(model, filt, b_unit, layer_names, family=family)
                 loss = group_loss(a_acts, b_acts, layer_names, cfg.metric, cfg.aggregation, cfg.layer_weights)
             if cfg.reg_weight > 0:
                 loss = loss + cfg.reg_weight * cast(Any, filt).reg_loss()
@@ -704,7 +810,7 @@ def calibrate_epochs(
             vlosses = []
             for ti, (_, tb_unit) in enumerate(test_pairs):
                 if use_det:
-                    vb_acts, vb_det = _forward_filtered_full(model, filt, tb_unit, layer_names)
+                    vb_acts, vb_det = _forward_filtered_full(model, filt, tb_unit, layer_names, family=family)
                     ta_det = test_a_det_all[ti]
                     if cfg.loss_mode == "detection":
                         vl = detection_output_loss(ta_det, vb_det)
@@ -715,7 +821,7 @@ def calibrate_epochs(
                         det_vl = detection_output_loss(ta_det, vb_det)
                         vl = feat_vl + cfg.detection_weight * det_vl
                 else:
-                    vb_acts = _forward_filtered(model, filt, tb_unit, layer_names)
+                    vb_acts = _forward_filtered(model, filt, tb_unit, layer_names, family=family)
                     vl = group_loss(test_a_acts_all[ti], vb_acts, layer_names, cfg.metric, cfg.aggregation, cfg.layer_weights)
                 vlosses.append(float(vl.detach()))
             v_loss = sum(vlosses) / len(vlosses)

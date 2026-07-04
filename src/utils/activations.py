@@ -41,7 +41,22 @@ LAYER_PATHS: Dict[str, str] = {
 }
 DEFAULT_LAYERS: Tuple[str, ...] = tuple(LAYER_PATHS.keys())
 
-_MODEL_CACHE: Dict[Tuple[str, str, str], Any] = {}
+# Non-RF-DETR families: no hand-picked dotted paths exist for these architectures,
+# so layer names are resolved at runtime via each model's own
+# ``get_available_layer_names()`` (see resolve_layer_path / list_available_layers).
+# "rfdetr" is deliberately absent: it keeps using LAYER_PATHS above unchanged.
+FAMILY_CLASSES: Dict[str, str] = {
+    "rfdetr": "LibreRFDETR",
+    "rtdetrv4": "LibreRTDETRv4",
+    "yolo9": "LibreYOLO9",
+    "fomo": "LibreFOMO",
+}
+
+# NestedTensor input wrapping (src/calibration.py) is an RF-DETR-only quirk;
+# every other family takes a plain (B, 3, H, W) tensor.
+FAMILIES_REQUIRING_NESTED_TENSOR: frozenset = frozenset({"rfdetr"})
+
+_MODEL_CACHE: Dict[Tuple[str, str, str, str], Any] = {}
 
 
 def _resolve_device(device: Optional[str]) -> torch.device:
@@ -50,53 +65,101 @@ def _resolve_device(device: Optional[str]) -> torch.device:
     return torch.device(device)
 
 
+def _import_model_class(family: str) -> Any:
+    if family not in FAMILY_CLASSES:
+        raise ValueError(f"Unknown family {family!r}; expected one of {list(FAMILY_CLASSES)}")
+    import libreyolo
+
+    return getattr(libreyolo, FAMILY_CLASSES[family])
+
+
 def load_model(
     size: str = "n",
     device: Optional[str] = None,
     weights_dir: Optional[Union[str, Path]] = None,
     model_path: Optional[Union[str, Path]] = None,
+    family: str = "rfdetr",
 ) -> Any:
-    """Load a frozen RF-DETR model via LibreYOLO.
+    """Load a frozen detector via LibreYOLO.
 
     Args:
-        size: Model size code ("n"=nano, "s", "m", "l").
+        size: Model size code. Meaning is family-specific (RF-DETR: "n"=nano,
+            "s", "m", "l"; others use their own ``INPUT_SIZES``/size codes).
         device: "auto" (default), "cuda", or "cpu".
         weights_dir: Directory holding `<size>` weights. Defaults to the
-            submodule's ``weights/`` dir; ``rf-detr-nano.pth`` is auto-downloaded
-            there on first use.
+            submodule's ``weights/`` dir; pretrained weights auto-download
+            there on first use (families whose weights are not redistributed,
+            e.g. ``fomo``, require an explicit ``model_path``).
         model_path: Explicit checkpoint to load (e.g. a fine-tuned
             ``weights/best.pt``). Overrides ``weights_dir``/``size`` weight lookup;
             used to evaluate/calibrate against a domain-adapted detector.
+        family: Model family key into ``FAMILY_CLASSES`` (default ``"rfdetr"``,
+            preserving prior behavior for existing callers).
 
     Returns:
-        The ``LibreRFDETR`` wrapper (cached per size/device/weights).
+        The LibreYOLO model wrapper (cached per family/size/device/weights).
     """
-    from libreyolo import LibreRFDETR
+    model_cls = _import_model_class(family)
 
-    if size not in INPUT_SIZES:
-        raise ValueError(f"Unknown size {size!r}; expected one of {list(INPUT_SIZES)}")
+    if family == "rfdetr":
+        if size not in INPUT_SIZES:
+            raise ValueError(f"Unknown size {size!r}; expected one of {list(INPUT_SIZES)}")
+        pretrain_names = {
+            "n": "rf-detr-nano.pth",
+            "s": "rf-detr-small.pth",
+            "m": "rf-detr-medium.pth",
+            "l": "rf-detr-large.pth",
+        }
+    else:
+        family_sizes = getattr(model_cls, "INPUT_SIZES", None)
+        if family_sizes and size not in family_sizes:
+            raise ValueError(f"Unknown size {size!r} for family {family!r}; expected one of {list(family_sizes)}")
+        pretrain_names = None
 
     if model_path is not None:
         ckpt = Path(model_path).resolve()
         if not ckpt.exists():
             raise FileNotFoundError(f"model_path does not exist: {ckpt}")
-    else:
+    elif pretrain_names is not None:
         wdir = Path(weights_dir).resolve() if weights_dir else DEFAULT_WEIGHTS_DIR.resolve()
         wdir.mkdir(parents=True, exist_ok=True)
-        pretrain = {
-            "n": "rf-detr-nano.pth",
-            "s": "rf-detr-small.pth",
-            "m": "rf-detr-medium.pth",
-            "l": "rf-detr-large.pth",
-        }[size]
-        ckpt = wdir / pretrain
+        ckpt = wdir / pretrain_names[size]
+    else:
+        # Generic LibreYOLO HF naming convention: "<FILENAME_PREFIX><size><WEIGHT_EXT>",
+        # e.g. "LibreRTDETRv4s.pt". `_load_weights` auto-downloads via
+        # `get_download_url` when this path doesn't exist yet. Families with no
+        # redistributable weights (e.g. LibreFOMO) return None from
+        # `get_download_url` and will raise FileNotFoundError below.
+        prefix = getattr(model_cls, "FILENAME_PREFIX", "")
+        ext = getattr(model_cls, "WEIGHT_EXT", ".pt")
+        if not prefix:
+            raise ValueError(
+                f"family {family!r} has no FILENAME_PREFIX for auto-download; pass model_path explicitly"
+            )
+        wdir = Path(weights_dir).resolve() if weights_dir else DEFAULT_WEIGHTS_DIR.resolve()
+        wdir.mkdir(parents=True, exist_ok=True)
+        ckpt = wdir / f"{prefix}{size}{ext}"
+        if not ckpt.exists():
+            # Some families' own `_load_weights` (e.g. LibreDFINE/LibreRTDETRv4)
+            # don't auto-download like RF-DETR's does; trigger it explicitly via
+            # the library's shared HF-download utility instead.
+            from libreyolo.utils.download import download_weights
+
+            try:
+                download_weights(str(ckpt), size)
+            except ValueError as exc:
+                raise FileNotFoundError(
+                    f"No pretrained weights auto-download available for family={family!r} "
+                    f"size={size!r} ({exc}). Pass model_path explicitly "
+                    "(e.g. LibreFOMO weights are not redistributed upstream)."
+                ) from exc
 
     dev = _resolve_device(device)
-    cache_key = (size, str(dev), str(ckpt))
+    cache_key = (family, size, str(dev), str(ckpt))
     if cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
 
-    libre = LibreRFDETR(model_path=str(ckpt), size=size, device=str(dev))
+    libre = model_cls(model_path=str(ckpt), size=size, device=str(dev))
     libre.model.eval()
     for p in libre.model.parameters():
         p.requires_grad_(False)
@@ -104,8 +167,18 @@ def load_model(
     return libre
 
 
-def _inner_model(libre: Any) -> torch.nn.Module:
-    return cast(torch.nn.Module, libre.model.model)
+def _inner_model(libre: Any, family: str = "rfdetr") -> torch.nn.Module:
+    """Return the raw detector nn.Module for dotted-path submodule lookup.
+
+    RF-DETR wraps an extra level (``libre.model`` is itself a wrapper exposing
+    ``.model`` as the actual ``LWDETR``). Other families' ``libre.model`` is
+    already the raw detector nn.Module (confirmed against
+    ``_get_available_layers()``, which references ``self.model.backbone`` etc.
+    directly in e.g. ``models/dfine/model.py``).
+    """
+    if family == "rfdetr":
+        return cast(torch.nn.Module, libre.model.model)
+    return cast(torch.nn.Module, libre.model)
 
 
 def _model_device(libre: Any) -> torch.device:
@@ -151,22 +224,67 @@ def normalize(unit_tensor: torch.Tensor) -> torch.Tensor:
     return (unit_tensor - mean) / std
 
 
-def preprocess(image: ImageLike, size: str = "n", input_size: Optional[int] = None) -> torch.Tensor:
+def _resolve_input_size(size: str, family: str = "rfdetr") -> int:
+    """Resolve the square input resolution for a given family/size code."""
+    if family == "rfdetr":
+        return INPUT_SIZES[size]
+    family_sizes = getattr(_import_model_class(family), "INPUT_SIZES", None)
+    if not family_sizes or size not in family_sizes:
+        raise ValueError(f"Unknown size {size!r} for family {family!r}")
+    return int(family_sizes[size])
+
+
+def preprocess(
+    image: ImageLike,
+    size: str = "n",
+    input_size: Optional[int] = None,
+    family: str = "rfdetr",
+) -> torch.Tensor:
     """Preprocess an image into a normalized (1, 3, H, W) model-input tensor.
 
     Mirrors LibreYOLO's RF-DETR preprocessor: RGB, bilinear resize to a square
     input, /255, then ImageNet mean/std normalization, CHW float32.
     """
-    res = input_size if input_size is not None else INPUT_SIZES[size]
+    res = input_size if input_size is not None else _resolve_input_size(size, family)
     unit = to_unit_rgb(image, res)
     return normalize(unit).unsqueeze(0)
 
 
-def resolve_layer_path(name: str) -> str:
-    """Map a canonical layer name to its dotted submodule path (pass-through if already full)."""
-    if name in LAYER_PATHS:
+def resolve_layer_path(name: str, family: str = "rfdetr") -> str:
+    """Map a canonical layer name to its dotted submodule path (pass-through if already full).
+
+    Only meaningful for ``family="rfdetr"`` (:data:`LAYER_PATHS`). Other families
+    have no hand-picked dotted paths: their layer names are resolved directly
+    against the model's own ``_get_available_layers()`` (see
+    :func:`_get_layer_module`), so this is a pass-through for them.
+    """
+    if family == "rfdetr" and name in LAYER_PATHS:
         return LAYER_PATHS[name]
     return name
+
+
+def _get_layer_module(libre: Any, name: str, family: str = "rfdetr") -> torch.nn.Module:
+    """Resolve a canonical layer name to an ``nn.Module`` for the given family.
+
+    RF-DETR uses vcalib's hand-picked dotted paths (:data:`LAYER_PATHS`) into
+    ``libre.model.model`` for fine-grained per-block hooking. Other families have
+    no such map; they're hooked via the model's own
+    ``get_available_layer_names()`` / ``_get_available_layers()`` contract, which
+    every LibreYOLO model family implements.
+    """
+    if family == "rfdetr":
+        path = resolve_layer_path(name, family=family)
+        inner = _inner_model(libre)
+        try:
+            return cast(torch.nn.Module, inner.get_submodule(path))
+        except AttributeError as exc:
+            raise AttributeError(f"Layer {name!r} (path {path!r}) not found in model") from exc
+    available = libre._get_available_layers()
+    if name not in available:
+        raise AttributeError(
+            f"Layer {name!r} not found for family {family!r}; available: {sorted(available)}"
+        )
+    return cast(torch.nn.Module, available[name])
 
 
 def _to_tensor(output: Any) -> Optional[torch.Tensor]:
@@ -199,25 +317,20 @@ class ActivationExtractor:
         self,
         model: Any,
         layers: Iterable[str] = DEFAULT_LAYERS,
+        family: str = "rfdetr",
     ) -> None:
         self.libre = model
-        self.inner = _inner_model(model)
+        self.family = family
+        self.inner = _inner_model(model, family=family)
         self.layers: Tuple[str, ...] = tuple(layers)
         self._handles: list = []
         self._acts: Dict[str, torch.Tensor] = {}
         self.last_output: Any = None
         self._register()
 
-    def _resolve_path(self, name: str) -> str:
-        return resolve_layer_path(name)
-
     def _register(self) -> None:
         for name in self.layers:
-            path = self._resolve_path(name)
-            try:
-                module = self.inner.get_submodule(path)
-            except AttributeError as exc:
-                raise AttributeError(f"Layer {name!r} (path {path!r}) not found in model") from exc
+            module = _get_layer_module(self.libre, name, family=self.family)
             handle = module.register_forward_hook(self._make_hook(name))
             self._handles.append(handle)
 
@@ -240,7 +353,7 @@ class ActivationExtractor:
     def extract(self, image: ImageLike) -> Dict[str, torch.Tensor]:
         """Run a frozen inference forward pass and return captured activations."""
         from_size = getattr(self.libre, "size", "n")
-        tensor = preprocess(image, size=from_size)
+        tensor = preprocess(image, size=from_size, family=self.family)
         tensor = tensor.to(_model_device(self.libre))
         self._acts.clear()
         self.libre.model.eval()
@@ -261,10 +374,11 @@ def extract_activations(
     size: str = "n",
     device: Optional[str] = None,
     weights_dir: Optional[Union[str, Path]] = None,
+    family: str = "rfdetr",
 ) -> Dict[str, torch.Tensor]:
     """Convenience: load (cached) model, run inference, return activations dict."""
-    libre = load_model(size=size, device=device, weights_dir=weights_dir)
-    with ActivationExtractor(libre, layers=layers) as ex:
+    libre = load_model(size=size, device=device, weights_dir=weights_dir, family=family)
+    with ActivationExtractor(libre, layers=layers, family=family) as ex:
         return ex.extract(image)
 
 
@@ -272,17 +386,29 @@ def list_available_layers(
     size: str = "n",
     device: Optional[str] = None,
     weights_dir: Optional[Union[str, Path]] = None,
+    family: str = "rfdetr",
 ) -> Dict[str, str]:
-    """Return canonical layer names mapped to their nn.Module class names."""
-    libre = load_model(size=size, device=device, weights_dir=weights_dir)
-    inner = _inner_model(libre)
+    """Return canonical layer names mapped to their nn.Module class names.
+
+    For ``family="rfdetr"`` this walks vcalib's hand-picked :data:`LAYER_PATHS`.
+    For other families it reports whatever the model itself exposes via
+    ``get_available_layer_names()`` — there is no fixed expected set, since each
+    architecture names its own submodules differently.
+    """
+    libre = load_model(size=size, device=device, weights_dir=weights_dir, family=family)
     out: Dict[str, str] = {}
-    for canon, path in LAYER_PATHS.items():
-        try:
-            mod = inner.get_submodule(path)
-            out[canon] = type(mod).__name__
-        except AttributeError:
-            out[canon] = "<missing>"
+    if family == "rfdetr":
+        inner = _inner_model(libre)
+        for canon, path in LAYER_PATHS.items():
+            try:
+                mod = inner.get_submodule(path)
+                out[canon] = type(mod).__name__
+            except AttributeError:
+                out[canon] = "<missing>"
+        return out
+    available = libre._get_available_layers()
+    for canon, mod in available.items():
+        out[canon] = type(mod).__name__
     return out
 
 

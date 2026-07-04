@@ -173,6 +173,22 @@ Full results: [`results/experiments/experiment_results.csv`](results/experiments
 
 ---
 
+## Beyond RF-DETR: does this generalize to other detectors?
+
+Everything above is RF-DETR nano. The natural question: is this a property of the *recipe* (fine-tune a domain ceiling, then train a filter against it — pair-free, real GT loss, no reference image needed at all), or something specific to RF-DETR's DINOv2 backbone?
+
+We fine-tuned **RT-DETRv4** (transformer, DETR lineage) and **YOLOv9** (anchor-based CNN) on the same tiny 20-scene cooktop reference set, then trained a *real*, GT-supervised, pair-free filter against each frozen, domain-adapted model, and benchmarked A'/B/filter(B) against the same independent SAM3 pseudo-GT used above.
+
+![AP comparison across RT-DETRv4 and YOLOv9](docs/images/multimodel_ap_comparison.png)
+
+![Does the filter help](docs/images/multimodel_delta.png)
+
+**YOLOv9 shows a real recovery signal** — on `level_2` the trained filter doesn't just close the illumination gap, `filter(B)` (0.261 AP) *exceeds the fine-tuned ceiling A'* (0.226 AP); on `level_3` it recovers about half the gap (+0.049 AP). **RT-DETRv4 does not show reliable recovery** in this first pass — flat on `level_3`, and `level_2`'s "gap" isn't even well-defined (B already scores above A' before any filter). Given the tiny 20-image fine-tune set and a single seed per cell, treat these as a first real data point, not a settled conclusion — see [`docs/finetune-rfdetr-ref.md`](docs/finetune-rfdetr-ref.md) for the full protocol, per-family training curves, and an important reproducibility caveat we found (RT-DETRv4's fine-tune is *not* bit-reproducible across identical-seed runs on this hardware, unlike YOLOv9's).
+
+**What had to be built to make this possible:** RF-DETR's pair-free filter trainer leans on an RF-DETR-only method for its GT-detection loss, so it doesn't carry over to other architectures for free. We wired up RT-DETRv4's own `DFINECriterion`+`HungarianMatcher` and YOLOv9's own internal task-aligned-assignment loss instead — see the "New code this required" note in the runbook doc for the details, including a BatchNorm-safety fix needed to keep the model genuinely frozen while activating these training-mode-only loss paths.
+
+---
+
 ## What's proven vs. what's next
 
 We'd rather be precise about what these numbers do and don't show.
@@ -183,11 +199,13 @@ We'd rather be precise about what these numbers do and don't show.
 - At the **mAP level**: scored against *independent* SAM3 pseudo-GT, a detection-calibrated filter closes the **full class-agnostic AP gap (121.5%)** — `filter(B)` scores above the reference A on AP, AP50 and AP75 — on held-out `level_2` pairs, vs ~1% of AP for the activation-trained filter.
 - It's cheap: thousands of params, minutes on a CPU, no model retraining, no labels (the filter is label-free; labels enter only to *score* mAP).
 - The signal is robust: same ranking across filter families, layer groups, and shift magnitudes — and *what you optimize is what you recover*.
+- **It's not RF-DETR-specific.** A real, GT-supervised pair-free filter trained against a fine-tuned **YOLOv9** recovers +0.049 to +0.167 AP over the shifted baseline (see [Beyond RF-DETR](#beyond-rf-detr-does-this-generalize-to-other-detectors)) — the recipe transfers to a different detector family, not just a different checkpoint of the same one.
 
 **🔧 What's next (the milestone that closes the loop)**
 - **mAP against human ground truth + a full-retrain upper bound.** We now have mAP against *independent pseudo-GT* (SAM3); the remaining proof is mAP / box-quality on **hand-annotated** shifted data, with a **full-retrain arm** as the upper-bound comparison — plus tightening high-IoU recovery under the stronger `level_3` shift.
 - **Per-condition generalization.** Confirm that one filter, fit once per environment, holds across a whole stream of frames (the deployment model above), not just per-image.
 - **Edge deploy CLI** to make "fit & swap a filter" a one-command operation.
+- **Multi-detector validation at scale.** RT-DETRv4's null result and YOLOv9's positive one both come from a single seed on a 20-image fine-tune set — repeat across seeds and a larger reference set before trusting either as a settled finding.
 
 ---
 
@@ -330,7 +348,9 @@ vcalib/
 │   ├── augment_dataset.py        # Geometry augmentation preserving A/B pairs
 │   ├── create_datasets.py        # Split augmented data by illumination level
 │   ├── autolabel_sam3.py         # SAM3 auto-labeling → COCO GT (bbox + masks)
-│   ├── benchmark_detection.py    # Phase 3: real mAP recovery vs SAM3 pseudo-GT
+│   ├── benchmark_detection.py    # Phase 3: real mAP recovery vs SAM3 pseudo-GT (family-aware)
+│   ├── finetune_{rfdetr,rtdetrv4,yolo9,fomo}.py       # per-family domain-adaptation fine-tune
+│   ├── train_filter_detloss_{rtdetrv4,yolo9}.py       # per-family pair-free GT-supervised filter trainer
 │   └── generate_visual_report.py # Per-scene before/after HTML report
 ├── tests/                    # 222+ tests (fast + slow smoke)
 ├── docs/
@@ -379,6 +399,7 @@ The runner (`run_configs.py`) loads the model once, iterates configs, and writes
 | 1 | ✅ Complete | Diagnostic sweep + real-pair calibration (35.9% on held-out captures) |
 | 2 | ✅ Complete | 200-config grid sweep (filter × layer group × level) |
 | 3 | 🔧 In progress | Detection recovery: 20.4% on detection outputs **+ full AP gap (121.5%) vs. SAM3 pseudo-GT** (held-out `level_2`); human GT + full-retrain upper bound next |
+| 4 | 🔧 In progress | Generalize beyond RF-DETR: real pair-free filter trained + benchmarked against **RT-DETRv4** and **YOLOv9** — YOLOv9 recovers real AP (+0.05 to +0.17), RT-DETRv4 doesn't yet; single-seed, needs repeats |
 | D | 📋 Planned | Edge deploy CLI (`deploy_calibrate.py`) — fit & swap a filter |
 
 ---

@@ -70,6 +70,8 @@ The converter auto-detects the canonical layout (`ExDark/`, `ExDark_Annno/`,
   EMA, `--patience`). Produces `results/finetune/<name>/weights/best.pt`.
 - `scripts/train_filter_detloss.py` — **pair-free filter trainer** (the core): detector-GT
   loss via `build_criterion_and_postprocess`, `--model-checkpoint` for the fine-tuned model.
+  **Combined mode** (`--act-weight λ --ref-split bright_train`): adds an unpaired CORAL
+  activation term on top of the GT-detection loss (see "Combined pair-free" section below).
 - `scripts/benchmark_detection.py --model-checkpoint <ckpt>` — A'/B/filter(B) on held-out test.
 - `scripts/run_finetune_matrix.sh [cuda]` — full cooktop matrix {head-only, LoRA} ×
   {no-aug, aggressive} + off-the-shelf baseline.
@@ -155,3 +157,69 @@ Supporting signals:
 Practical takeaway: for detection recovery use `loss_mode=combined` (or `detection`) and
 early-stop on **AP**, not on the feature metric. Raw trajectories:
 `results/coupling/{activation,detection,combined}.jsonl` (CSV `coupling.csv` is gitignored).
+
+## Combined pair-free filter — det-GT + unpaired CORAL activations · 2026-07-04
+
+The coupling study showed the winning recipe on **paired** cooktop is `combined` = activations
++ detections. We want to keep that "both signals" idea in the **pair-free** (no per-scene A)
+setting where the plain detection-only filter *degraded* AP on ExDark. The blocker: the paired
+`combined` activation term is `group_loss(A_acts, filter(B)_acts)` — it needs A of the same
+scene, which does not exist here.
+
+**Design (implemented in `scripts/train_filter_detloss.py`):** replace the per-scene activation
+target with **unpaired, domain-level activation alignment**. We still never touch a per-scene A —
+we only use the reference-condition *domain* (`bright_train`), which is observable:
+
+1. Precompute, once, the projector-feature statistics (channel **mean** `μ_ref` + **covariance**
+   `Σ_ref`, C=256) over the whole reference/bright domain through the frozen model. Streamed +
+   cached at `data/coco/exdark/ref_moments/<split>__<layer>__n<N>.pt` (gitignored).
+2. Per step: `filter(dark) → projector acts`; add a **CORAL** term pulling the filtered image's
+   `(μ, Σ)` toward `(μ_ref, Σ_ref)`. Total loss = `det_GT_loss + λ·(mean_term + cov_term)`.
+3. Model selection early-stops on **`val_det`** (the real detection objective), *not* the CORAL
+   term — directly honoring the coupling-study lesson that selecting on the feature metric
+   overshoots AP.
+
+**CORAL scaling gotcha (important):** classic Deep-CORAL scales the covariance by `1/(4d²)`.
+At d=256 that is `1/262144`, which crushes `cov_term` to ~1e-6 vs a `mean_term` ~0.25 — i.e. it
+silently degenerates to mean-matching. We use **raw Frobenius** so `‖Σ−Σ_ref‖²_F` (~0.76) stays
+comparable to (in fact larger than) the mean term, and the covariance signal actually
+contributes. `metrics.jsonl` logs `train/val_act_mean` and `train/val_act_cov` separately.
+
+Run (adds `baseline_coral` + `adapted_coral` arms alongside the detection-only ones):
+```bash
+ACT_WEIGHT=1.0 REF_SPLIT=bright_train ./scripts/run_exdark_matrix.sh cuda
+# or a single arm directly:
+uv run python scripts/train_filter_detloss.py --data data/coco/exdark \
+    --train-split dark_train --val-split dark_val --label-map exdark_coco \
+    --act-weight 1.0 --ref-split bright_train --act-layer backbone.projector \
+    --out results/experiments/runs/exdark_pairfree_baseline_coral --device cuda
+```
+`--act-weight 0` (the default) keeps the original detection-only behaviour byte-for-byte.
+Smoke-validated end-to-end on CUDA (ref moments + cache, CORAL train/val, early-stop, benchmark
+plumbing).
+
+### Result — adapted arm, det-GT + CORAL vs det-only (ExDark `dark_test`) · 2026-07-04
+
+Ran only the `adapted_coral` arm over the existing A' (`results/finetune/exdark_bright/weights/best.pt`):
+`λ=1.0`, `--ref-split bright_train` (moments through A'), `backbone.projector`, 50 ep / patience 10.
+
+**Headline: the unpaired CORAL activation term did NOT recover AP — it degraded it *more* than
+detection-only.** The falsifiable question fires negative.
+
+| pair-free supervision | filter(B) AP | AP50 | Δ vs B (0.5528) |
+|---|---|---|---|
+| detection-only (recorded) | 0.5410 | 0.8038 | −0.0118 (−2.1%) |
+| **det + CORAL (this run)** | **0.5332** | 0.7953 | **−0.0196 (−3.5%)** |
+
+CSV: `results/ft_bench/exdark_adapted_coral.csv`. Why it fails (training diagnostics):
+- Converged/early-stopped fast: `best val_det = 9.333 @ epoch 4` — *worse* than det-only (~9.315
+  @ ep 6), i.e. the CORAL term pulls the filter off the pure-detection optimum.
+- The CORAL terms barely move (val `act_cov` 1.26→1.22, `act_mean` ~0.92 flat): a tone-curve
+  filter can hardly close the domain-level statistic gap, and the little it closes costs detection.
+
+**Interpretation:** reinforces the coupling-study conclusion — the bottleneck is the *unpaired*
+supervision itself. Domain-level (mean+cov) activation alignment is too weak a signal (it washes
+out per-scene content) and conflicts with per-image detection fitting. Paired `combined` worked
+only because A was a *same-scene* reference; there is no unpaired substitute at the projector here.
+Not falsified only for this design point (λ=1, projector, mean+cov) — a λ sweep would harden the
+null, but the flat CORAL trajectory suggests it is not a weighting artifact.
